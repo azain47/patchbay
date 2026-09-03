@@ -444,7 +444,7 @@ final class Bar: NSObject {
         pop.behavior = .transient
 
         if let b = item.button {
-            b.image = NSImage(systemSymbolName: "waveform", accessibilityDescription: "AudioFix")
+            b.image = NSImage(systemSymbolName: "waveform", accessibilityDescription: "patchbay")
             b.target = self
             b.action = #selector(tap)
         }
@@ -452,7 +452,7 @@ final class Bar: NSObject {
         audio.onHealth = { [weak self] ok in
             self?.item.button?.image = NSImage(
                 systemSymbolName: ok ? "waveform" : "waveform.badge.exclamationmark",
-                accessibilityDescription: "AudioFix"
+                accessibilityDescription: "patchbay"
             )
         }
     }

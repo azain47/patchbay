@@ -1,7 +1,7 @@
 #!/bin/bash
 set -euo pipefail
 
-NAME="AudioFix"
+NAME="patchbay"
 DIR="$(cd "$(dirname "$0")" && pwd)"
 APP="$DIR/$NAME.app"
 
@@ -25,11 +25,11 @@ cat > "$APP/Contents/Info.plist" << 'EOF'
 <plist version="1.0">
 <dict>
     <key>CFBundleIdentifier</key>
-    <string>com.audiofix.app</string>
+    <string>com.patchbay.app</string>
     <key>CFBundleName</key>
-    <string>AudioFix</string>
+    <string>patchbay</string>
     <key>CFBundleExecutable</key>
-    <string>AudioFix</string>
+    <string>patchbay</string>
     <key>CFBundleVersion</key>
     <string>1.0</string>
     <key>CFBundleShortVersionString</key>
