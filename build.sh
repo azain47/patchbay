@@ -7,17 +7,32 @@ APP="$DIR/$NAME.app"
 
 rm -rf "$APP"
 mkdir -p "$APP/Contents/MacOS"
+OBJ="$DIR/.DSPConfig.o"
+trap 'rm -f "$OBJ"' EXIT
+
+clang \
+    -O3 \
+    -std=c11 \
+    -target arm64-apple-macosx15.0 \
+    -c "$DIR/DSPConfig.c" \
+    -o "$OBJ"
 
 swiftc \
     -O \
     -whole-module-optimization \
-    -target arm64-apple-macosx14.0 \
+    -target arm64-apple-macosx15.0 \
+    -import-objc-header "$DIR/DSPConfig.h" \
     -framework Cocoa \
     -framework SwiftUI \
     -framework CoreAudio \
+    -framework AudioToolbox \
     -suppress-warnings \
     -o "$APP/Contents/MacOS/$NAME" \
-    "$DIR/main.swift"
+    "$DIR/main.swift" \
+    "$DIR/DSP.swift" \
+    "$DIR/AudioEngine.swift" \
+    "$DIR/RackView.swift" \
+    "$OBJ"
 
 cat > "$APP/Contents/Info.plist" << 'EOF'
 <?xml version="1.0" encoding="UTF-8"?>
@@ -39,9 +54,11 @@ cat > "$APP/Contents/Info.plist" << 'EOF'
     <key>CFBundlePackageType</key>
     <string>APPL</string>
     <key>LSMinimumSystemVersion</key>
-    <string>14.0</string>
+    <string>15.0</string>
     <key>NSHighResolutionCapable</key>
     <true/>
+    <key>NSAudioCaptureUsageDescription</key>
+    <string>patchbay needs access to process system audio through your effects rack.</string>
 </dict>
 </plist>
 EOF

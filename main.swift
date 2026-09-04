@@ -138,66 +138,232 @@ enum CA {
 
 // ─── State ──────────────────────────────────────────────
 
-enum Action: Equatable { case fix, restart, reset }
+enum Action: Equatable { case fix, restart, reset, rack }
 
 final class AudioState: ObservableObject {
     @Published var devices: [Device] = []
     @Published var eqMacOn = false
     @Published var active: Action? = nil
     @Published var healthy = true
+    @Published var rack = RackSettings.neutral
+    @Published var rackOn = false
+    @Published var rackStatus: SystemAudioEngine.Status = .stopped
+    @Published var rackPeak: Float = 0
 
     var real: [Device] { devices.filter { !$0.isEqMac } }
     var current: Device? { devices.first { $0.isDefault } }
+    var rackTarget: Device? {
+        if let current, !current.isEqMac { return current }
+        return CA.bestReal(from: devices)
+    }
 
     private var timer: Timer?
+    private var meterTimer: Timer?
     private var outputListener: AudioObjectPropertyListenerBlock?
     private var devicesListener: AudioObjectPropertyListenerBlock?
+    private var wakeObserver: NSObjectProtocol?
+    private let rackStore = RackSettingsStore()
+    private let engine = SystemAudioEngine()
+    private var rackDeviceUID: String?
     var onHealth: ((Bool) -> Void)?
 
     init() {
+        engine.onStatus = { [weak self] status in self?.rackStatus = status }
         refresh()
         installListeners()
         timer = Timer.scheduledTimer(withTimeInterval: 10, repeats: true) { [weak self] _ in
             DispatchQueue.main.async { self?.updateHealth() }
         }
+        meterTimer = Timer.scheduledTimer(withTimeInterval: 0.05, repeats: true) { [weak self] _ in
+            guard let self else { return }
+            self.rackPeak = self.rackOn ? self.engine.peak : 0
+        }
+        wakeObserver = NSWorkspace.shared.notificationCenter.addObserver(
+            forName: NSWorkspace.didWakeNotification,
+            object: nil,
+            queue: .main
+        ) { [weak self] _ in
+            guard let self, self.rackOn, let target = self.rackTarget else { return }
+            self.engine.start(output: target, settings: self.rack)
+        }
     }
 
-    // ── CoreAudio listeners (read-only, UI refresh only) ──
+    deinit {
+        timer?.invalidate()
+        meterTimer?.invalidate()
+        engine.stop()
+        if let wakeObserver { NSWorkspace.shared.notificationCenter.removeObserver(wakeObserver) }
+        if let outputListener {
+            var address = CA.addr(kAudioHardwarePropertyDefaultOutputDevice)
+            AudioObjectRemovePropertyListenerBlock(
+                AudioObjectID(kAudioObjectSystemObject), &address, nil, outputListener)
+        }
+        if let devicesListener {
+            var address = CA.addr(kAudioHardwarePropertyDevices)
+            AudioObjectRemovePropertyListenerBlock(
+                AudioObjectID(kAudioObjectSystemObject), &address, nil, devicesListener)
+        }
+    }
 
     private func installListeners() {
-        var outAddr = CA.addr(kAudioHardwarePropertyDefaultOutputDevice)
-        let outBlock: AudioObjectPropertyListenerBlock = { [weak self] _, _ in
+        var outputAddress = CA.addr(kAudioHardwarePropertyDefaultOutputDevice)
+        let outputBlock: AudioObjectPropertyListenerBlock = { [weak self] _, _ in
             DispatchQueue.main.async { self?.refresh() }
         }
-        outputListener = outBlock
-        AudioObjectAddPropertyListenerBlock(AudioObjectID(kAudioObjectSystemObject), &outAddr, nil, outBlock)
+        outputListener = outputBlock
+        AudioObjectAddPropertyListenerBlock(
+            AudioObjectID(kAudioObjectSystemObject), &outputAddress, nil, outputBlock)
 
-        var devAddr = CA.addr(kAudioHardwarePropertyDevices)
-        let devBlock: AudioObjectPropertyListenerBlock = { [weak self] _, _ in
+        var devicesAddress = CA.addr(kAudioHardwarePropertyDevices)
+        let devicesBlock: AudioObjectPropertyListenerBlock = { [weak self] _, _ in
             DispatchQueue.main.async { self?.refresh() }
         }
-        devicesListener = devBlock
-        AudioObjectAddPropertyListenerBlock(AudioObjectID(kAudioObjectSystemObject), &devAddr, nil, devBlock)
+        devicesListener = devicesBlock
+        AudioObjectAddPropertyListenerBlock(
+            AudioObjectID(kAudioObjectSystemObject), &devicesAddress, nil, devicesBlock)
     }
-
-    // ── State ──
 
     func refresh() {
         devices = CA.devices()
-        eqMacOn = alive("eqMac")
+        eqMacOn = Self.alive("eqMac")
         updateHealth()
+        synchronizeRackDevice()
     }
 
     private func updateHealth() {
-        eqMacOn = alive("eqMac")
+        eqMacOn = Self.alive("eqMac")
         let was = healthy
         healthy = !((!eqMacOn) && (current?.isEqMac == true))
         if was != healthy { onHealth?(healthy) }
     }
 
-    func switchTo(_ d: Device) {
-        CA.setDefault(d.id)
-        DispatchQueue.main.asyncAfter(deadline: .now() + 0.3) { self.refresh() }
+    private func synchronizeRackDevice() {
+        guard let target = rackTarget else {
+            if rackOn {
+                engine.stop()
+                rackStatus = .failed("No physical output device is available.")
+            }
+            return
+        }
+
+        if rackDeviceUID != target.uid {
+            rackDeviceUID = target.uid
+            var loaded = rackStore.settings(for: target.uid)
+            loaded.enabled = rackOn
+            rack = loaded
+        }
+
+        guard rackOn, active != .rack, engine.outputUID != target.uid else { return }
+        engine.start(output: target, settings: rack)
+    }
+
+    func switchTo(_ device: Device) {
+        if rackOn && device.isEqMac {
+            setRackOn(false)
+        }
+        engine.stop()
+        CA.setDefault(device.id)
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.3) {
+            self.refresh()
+            if self.rackOn, let target = self.rackTarget {
+                self.engine.start(output: target, settings: self.rack)
+            }
+        }
+    }
+
+    func setRackOn(_ enabled: Bool) {
+        guard enabled != rackOn else { return }
+        if !enabled {
+            rackOn = false
+            rack.enabled = false
+            persistRack()
+            engine.stop()
+            return
+        }
+
+        guard let target = rackTarget else {
+            rackStatus = .failed("No physical output device is available.")
+            return
+        }
+
+        rackOn = true
+        rack.enabled = true
+        persistRack()
+        active = .rack
+        bg {
+            if Self.alive("eqMac") {
+                Self.kill("eqMac")
+                usleep(500_000)
+            }
+            CA.setDefault(target.id)
+            DispatchQueue.main.async {
+                self.refresh()
+                self.engine.start(output: target, settings: self.rack)
+                self.active = nil
+            }
+        }
+    }
+
+    func setPreamp(_ value: Double) {
+        updateRack { $0.preampDB = value }
+    }
+
+    func setBalance(_ value: Double) {
+        updateRack { $0.balance = value }
+    }
+
+    func setLimiterThreshold(_ value: Double) {
+        updateRack { $0.limiterThresholdDB = value }
+    }
+
+    func setBandEnabled(_ id: UUID, _ enabled: Bool) {
+        updateBand(id) { $0.enabled = enabled }
+    }
+
+    func setBandType(_ id: UUID, _ type: FilterType) {
+        updateBand(id) { $0.type = type }
+    }
+
+    func setBandFrequency(_ id: UUID, _ frequency: Double) {
+        updateBand(id) { $0.frequency = frequency }
+    }
+
+    func setBandGain(_ id: UUID, _ gain: Double) {
+        updateBand(id) { $0.gainDB = gain }
+    }
+
+    func setBandQ(_ id: UUID, _ q: Double) {
+        updateBand(id) { $0.q = q }
+    }
+
+    func moveModule(at index: Int, by offset: Int) {
+        let destination = index + offset
+        guard rack.modules.indices.contains(index), rack.modules.indices.contains(destination) else { return }
+        updateRack { $0.modules.swapAt(index, destination) }
+    }
+
+    func resetRack() {
+        var neutral = RackSettings.neutral
+        neutral.enabled = rackOn
+        rack = neutral
+        persistRack()
+        engine.publish(rack)
+    }
+
+    private func updateBand(_ id: UUID, _ mutation: (inout EQBand) -> Void) {
+        guard let index = rack.bands.firstIndex(where: { $0.id == id }) else { return }
+        updateRack { mutation(&$0.bands[index]) }
+    }
+
+    private func updateRack(_ mutation: (inout RackSettings) -> Void) {
+        mutation(&rack)
+        persistRack()
+        engine.publish(rack)
+    }
+
+    private func persistRack() {
+        guard let uid = rackDeviceUID else { return }
+        rackStore.save(rack, for: uid)
     }
 
     func fixAudio() {
@@ -206,10 +372,13 @@ final class AudioState: ObservableObject {
         bg {
             let eqMacInvolved = Self.alive("eqMac")
                 || CA.devices().first(where: { $0.isDefault })?.isEqMac == true
-            Self.kill("eqMac"); sleep(2)
-            if let b = CA.bestReal(from: CA.devices()) { CA.setDefault(b.id) }
+            Self.kill("eqMac")
+            sleep(2)
+            if let best = CA.bestReal(from: CA.devices()) { CA.setDefault(best.id) }
             if eqMacInvolved {
-                sleep(1); self.launchEqMac(); sleep(6)
+                sleep(1)
+                self.launchEqMac()
+                sleep(6)
             } else {
                 usleep(500_000)
             }
@@ -219,39 +388,57 @@ final class AudioState: ObservableObject {
 
     func restartEqMac() {
         guard active == nil else { return }
+        if rackOn { setRackOn(false) }
         active = .restart
         bg {
-            Self.kill("eqMac"); sleep(2)
-            if let b = CA.bestReal(from: CA.devices()) { CA.setDefault(b.id) }
+            Self.kill("eqMac")
+            sleep(2)
+            if let best = CA.bestReal(from: CA.devices()) { CA.setDefault(best.id) }
             sleep(1)
-            self.launchEqMac(); sleep(6)
+            self.launchEqMac()
+            sleep(6)
             DispatchQueue.main.async { self.refresh(); self.active = nil }
         }
     }
 
     func resetCA() {
         guard active == nil else { return }
+        let restartRackAfterReset = rackOn
+        if rackOn { setRackOn(false) }
         active = .reset
         bg {
-            let was = self.alive("eqMac")
-            let sc = NSAppleScript(source: #"do shell script "killall coreaudiod" with administrator privileges"#)
-            var e: NSDictionary?
-            sc?.executeAndReturnError(&e)
-            if e != nil { DispatchQueue.main.async { self.active = nil }; return }
-            sleep(3)
-            if was {
-                Self.kill("eqMac"); sleep(1)
-                if let b = CA.bestReal(from: CA.devices()) { CA.setDefault(b.id) }
-                sleep(1); self.launchEqMac(); sleep(6)
+            let eqMacWasRunning = Self.alive("eqMac")
+            let script = NSAppleScript(
+                source: #"do shell script "killall coreaudiod" with administrator privileges"#)
+            var error: NSDictionary?
+            script?.executeAndReturnError(&error)
+            if error != nil {
+                DispatchQueue.main.async { self.active = nil }
+                return
             }
-            DispatchQueue.main.async { self.refresh(); self.active = nil }
+            sleep(3)
+            if eqMacWasRunning {
+                Self.kill("eqMac")
+                sleep(1)
+                if let best = CA.bestReal(from: CA.devices()) { CA.setDefault(best.id) }
+                sleep(1)
+                self.launchEqMac()
+                sleep(6)
+            }
+            DispatchQueue.main.async {
+                self.refresh()
+                self.active = nil
+                if restartRackAfterReset { self.setRackOn(true) }
+            }
         }
     }
 
     private func launchEqMac() {
         DispatchQueue.main.async {
-            NSWorkspace.shared.openApplication(at: URL(fileURLWithPath: "/Applications/eqMac.app"),
-                                               configuration: NSWorkspace.OpenConfiguration()) { _, _ in }
+            NSWorkspace.shared.openApplication(
+                at: URL(fileURLWithPath: "/Applications/eqMac.app"),
+                configuration: NSWorkspace.OpenConfiguration()
+            ) { _, _ in }
         }
     }
 
@@ -259,16 +446,25 @@ final class AudioState: ObservableObject {
         DispatchQueue.global(qos: .userInitiated).async(execute: work)
     }
 
-    private func alive(_ name: String) -> Bool { Self.alive(name) }
     private static func alive(_ name: String) -> Bool {
-        let p = Process(); p.executableURL = URL(fileURLWithPath: "/usr/bin/pgrep")
-        p.arguments = ["-x", name]; p.standardOutput = FileHandle.nullDevice; p.standardError = FileHandle.nullDevice
-        try? p.run(); p.waitUntilExit(); return p.terminationStatus == 0
+        let process = Process()
+        process.executableURL = URL(fileURLWithPath: "/usr/bin/pgrep")
+        process.arguments = ["-x", name]
+        process.standardOutput = FileHandle.nullDevice
+        process.standardError = FileHandle.nullDevice
+        try? process.run()
+        process.waitUntilExit()
+        return process.terminationStatus == 0
     }
+
     private static func kill(_ name: String) {
-        let p = Process(); p.executableURL = URL(fileURLWithPath: "/usr/bin/pkill")
-        p.arguments = ["-9", "-x", name]; p.standardOutput = FileHandle.nullDevice; p.standardError = FileHandle.nullDevice
-        try? p.run(); p.waitUntilExit()
+        let process = Process()
+        process.executableURL = URL(fileURLWithPath: "/usr/bin/pkill")
+        process.arguments = ["-9", "-x", name]
+        process.standardOutput = FileHandle.nullDevice
+        process.standardError = FileHandle.nullDevice
+        try? process.run()
+        process.waitUntilExit()
     }
 }
 
@@ -294,6 +490,7 @@ struct Tap: ButtonStyle {
 
 struct PopoverBody: View {
     @ObservedObject var audio: AudioState
+    let openRack: () -> Void
 
     var body: some View {
         VStack(alignment: .leading, spacing: 0) {
@@ -305,7 +502,9 @@ struct PopoverBody: View {
             }
             .padding(.top, 8)
 
-            Color.clear.frame(height: 10)
+            Color.clear.frame(height: 4)
+            RackSummary(audio: audio, open: openRack)
+            Color.clear.frame(height: 4)
 
             VStack(spacing: 0) {
                 Act("Fix audio",       "wrench.fill",       .fix,     audio) { audio.fixAudio() }
@@ -331,7 +530,7 @@ struct PopoverBody: View {
             .padding(.horizontal, 14)
             .padding(.bottom, 8)
         }
-        .frame(width: 260)
+        .frame(width: 280)
     }
 }
 
@@ -434,13 +633,20 @@ final class Bar: NSObject {
     private var pop: NSPopover!
     private let audio = AudioState()
     private var monitor: Any?
+    private let rackWindow = RackWindowController()
 
     override init() {
         super.init()
 
         item = NSStatusBar.system.statusItem(withLength: NSStatusItem.variableLength)
         pop = NSPopover()
-        pop.contentViewController = NSHostingController(rootView: PopoverBody(audio: audio))
+        pop.contentViewController = NSHostingController(
+            rootView: PopoverBody(audio: audio) { [weak self] in
+                guard let self else { return }
+                self.hide()
+                self.rackWindow.show(audio: self.audio)
+            }
+        )
         pop.behavior = .transient
 
         if let b = item.button {
