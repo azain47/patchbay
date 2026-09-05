@@ -69,8 +69,10 @@ enum CA {
             AudioObjectGetPropertyDataSize(id, &sa, 0, nil, &ss)
             guard ss > 0 else { return nil }
             let name = strProp(id, kAudioObjectPropertyName)
-            guard !name.isEmpty, !name.contains("eqMac Export"), !name.hasPrefix("patchbay") else { return nil }
-            return Device(id: id, uid: strProp(id, kAudioDevicePropertyDeviceUID), name: name,
+            let uid = strProp(id, kAudioDevicePropertyDeviceUID)
+            // Our own private aggregates are visible to us alone; nothing else carries this UID prefix.
+            guard !name.isEmpty, !name.contains("eqMac Export"), !uid.hasPrefix("com.patchbay.") else { return nil }
+            return Device(id: id, uid: uid, name: name,
                           transport: u32Prop(id, kAudioDevicePropertyTransportType),
                           rate: f64Prop(id, kAudioDevicePropertyNominalSampleRate), isInput: input, isDefault: id == defID)
         }
