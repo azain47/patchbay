@@ -204,7 +204,7 @@ struct Root: View {
                         .allowsHitTesting(active)
                 }
             }
-            .transaction { $0.animation = nil }
+            .animation(nil, value: tab)
 
             Rectangle().fill(T.hairline).frame(height: 0.5)
             Footer(audio: audio, theme: theme)
@@ -249,26 +249,26 @@ struct TabBar: View {
     @Binding var tab: Tab
 
     /// Deliberately static. A tab switch changes nothing but which icon is lit;
-    /// no sliding pill, no symbol morph, no press scale. The page swap is instant too.
+    /// no sliding pill, no symbol morph. The page swap is instant too.
     var body: some View {
         HStack(spacing: 2) {
             ForEach(Tab.allCases) { t in
                 Button { tab = t } label: {
                     Image(systemName: t.symbol)
                         .font(.system(size: 11, weight: .medium))
-                        .foregroundStyle(tab == t ? AnyShapeStyle(T.accent) : AnyShapeStyle(.secondary))
+                        .foregroundStyle(tab == t ? .primary : .secondary)
                         .frame(width: 30, height: 22)
                         .background(Capsule().fill(tab == t ? T.press : .clear))
                         .contentShape(Capsule())
                 }
-                .buttonStyle(.plain)
+                .buttonStyle(Press())
                 .help(t.title)
             }
         }
         .padding(2)
         .background(Capsule().fill(T.card))
         .overlay(Capsule().strokeBorder(T.hairline, lineWidth: 0.5))
-        .transaction { $0.animation = nil }
+        .animation(nil, value: tab)
     }
 }
 
