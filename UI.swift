@@ -240,7 +240,7 @@ struct Root: View {
     private var statusColor: Color {
         guard audio.scopeOn else { return Color.secondary.opacity(0.35) }
         switch audio.scopeStatus {
-        case .running: return audio.rack.bypass ? T.accent : T.ok
+        case .running: return audio.headerBypass ? T.accent : T.ok
         case .proving, .waiting: return T.accent
         case .failed: return T.warn
         case .stopped: return Color.secondary.opacity(0.35)

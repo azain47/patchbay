@@ -476,6 +476,7 @@ final class AudioState: ObservableObject {
         for route in routes {
             let objects = objects(for: route)
             let device = outputs.first { $0.uid == route.outputUID }
+            engineLog.info("route \(route.name, privacy: .public) [\(route.bundleID, privacy: .public)] enabled \(route.enabled) processes \(objects.count) device \(device?.name ?? "missing", privacy: .public)")
             guard route.enabled, let device, !objects.isEmpty else {
                 if !route.enabled {
                     routeEngines.removeValue(forKey: route.id)?.stop()
@@ -590,6 +591,8 @@ final class AudioState: ObservableObject {
         case .route(let id): routeStatus[id] ?? .stopped
         }
     }
+    /// Bypass state of whatever the header refers to.
+    var headerBypass: Bool { headerScope == .system ? systemRack.bypass : rack.bypass }
     func setScopeOn(_ on: Bool) {
         switch headerScope {
         case .system: setRackOn(on)
