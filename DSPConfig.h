@@ -1,51 +1,42 @@
 #ifndef PATCHBAY_DSP_CONFIG_H
 #define PATCHBAY_DSP_CONFIG_H
 
-#include <stdbool.h>
 #include <stdint.h>
 
-#define PB_MAX_BANDS 12
-#define PB_MAX_MODULES 8
-
-typedef enum : uint32_t {
-    PBModulePreamp = 1,
-    PBModuleEqualizer = 2,
-    PBModuleBalance = 3,
-    PBModuleLimiter = 4,
-} PBModuleKind;
+#define PB_MAX_MODULES 16
+#define PB_MAX_PARAMS 12
+#define PB_MAX_BIQUADS 128
 
 typedef struct {
-    double b0;
-    double b1;
-    double b2;
-    double a1;
-    double a2;
+    double b0, b1, b2, a1, a2;
+} PBBiquad;
+
+typedef struct {
+    uint32_t kind;
     uint32_t enabled;
-} PBBiquadCoefficients;
+    uint32_t biquadStart;
+    uint32_t biquadCount;
+    float params[PB_MAX_PARAMS];
+} PBModule;
 
 typedef struct {
     uint64_t generation;
-    float preampLinear;
-    float leftGain;
-    float rightGain;
-    float limiterThreshold;
+    uint64_t layoutGeneration;
+    float sampleRate;
+    uint32_t bypass;
     uint32_t moduleCount;
-    uint32_t bandCount;
-    uint32_t modules[PB_MAX_MODULES];
-    PBBiquadCoefficients bands[PB_MAX_BANDS];
+    uint32_t biquadCount;
+    PBModule modules[PB_MAX_MODULES];
+    PBBiquad biquads[PB_MAX_BIQUADS];
 } PBDSPConfig;
 
 typedef struct PBDSPConfigStore PBDSPConfigStore;
 
 PBDSPConfigStore *PBDSPConfigStoreCreate(void);
 void PBDSPConfigStoreDestroy(PBDSPConfigStore *store);
+/// Publishes a snapshot. Retires snapshots older than two seconds; the realtime
+/// reader never holds a pointer across callbacks, so that grace window is safe.
 void PBDSPConfigStorePublish(PBDSPConfigStore *store, const PBDSPConfig *config);
 const PBDSPConfig *PBDSPConfigStoreLoad(const PBDSPConfigStore *store);
-
-void PBDSPConfigInit(PBDSPConfig *config, uint64_t generation);
-void PBDSPConfigSetModule(PBDSPConfig *config, uint32_t index, uint32_t module);
-void PBDSPConfigSetBand(PBDSPConfig *config, uint32_t index, PBBiquadCoefficients coefficients);
-uint32_t PBDSPConfigModule(const PBDSPConfig *config, uint32_t index);
-const PBBiquadCoefficients *PBDSPConfigBand(const PBDSPConfig *config, uint32_t index);
 
 #endif

@@ -1,8 +1,9 @@
 import Cocoa
 import SwiftUI
 import CoreAudio
+import UniformTypeIdentifiers
 
-// ─── Model ──────────────────────────────────────────────
+// MARK: - Device model
 
 struct Device: Identifiable, Equatable {
     let id: AudioDeviceID
@@ -10,99 +11,113 @@ struct Device: Identifiable, Equatable {
     let name: String
     let transport: UInt32
     let rate: Double
+    let isInput: Bool
     var isDefault: Bool
 
     var isEqMac: Bool { name.contains("eqMac") }
 
     var icon: String {
+        if isInput { return transport == kAudioDeviceTransportTypeBuiltIn ? "mic" : "mic.badge.plus" }
         if isEqMac { return "waveform.path.ecg" }
+        let lower = name.lowercased()
+        if lower.contains("airpods") { return "airpods" }
+        if lower.contains("headphone") || lower.contains("buds") || lower.contains("ear") { return "headphones" }
         switch transport {
-        case kAudioDeviceTransportTypeBuiltIn:
-            return name.lowercased().contains("headphone") ? "headphones" : "hifispeaker.fill"
-        case kAudioDeviceTransportTypeBluetooth, kAudioDeviceTransportTypeBluetoothLE:
-            return "dot.radiowaves.left.and.right"
-        case kAudioDeviceTransportTypeHDMI, kAudioDeviceTransportTypeDisplayPort:
-            return "display"
-        case kAudioDeviceTransportTypeUSB:
-            return "cable.connector"
-        case kAudioDeviceTransportTypeAirPlay:
-            return "airplayaudio"
-        default: return "speaker.fill"
+        case kAudioDeviceTransportTypeBuiltIn: return "laptopcomputer"
+        case kAudioDeviceTransportTypeBluetooth, kAudioDeviceTransportTypeBluetoothLE: return "headphones"
+        case kAudioDeviceTransportTypeHDMI, kAudioDeviceTransportTypeDisplayPort: return "display"
+        case kAudioDeviceTransportTypeUSB: return "hifispeaker"
+        case kAudioDeviceTransportTypeAirPlay: return "airplayaudio"
+        case kAudioDeviceTransportTypeVirtual: return "circle.dotted"
+        default: return "speaker.wave.2"
         }
     }
 
     var transportLabel: String {
         switch transport {
-        case kAudioDeviceTransportTypeBuiltIn:       "built-in"
-        case kAudioDeviceTransportTypeBluetooth:      "bluetooth"
-        case kAudioDeviceTransportTypeBluetoothLE:    "bluetooth le"
-        case kAudioDeviceTransportTypeUSB:            "usb"
-        case kAudioDeviceTransportTypeHDMI:           "hdmi"
-        case kAudioDeviceTransportTypeDisplayPort:    "displayport"
-        case kAudioDeviceTransportTypeVirtual:        "virtual"
-        case kAudioDeviceTransportTypeAirPlay:        "airplay"
-        case kAudioDeviceTransportTypeThunderbolt:    "thunderbolt"
-        case kAudioDeviceTransportTypeFireWire:       "firewire"
-        default:                                      "other"
+        case kAudioDeviceTransportTypeBuiltIn: "built-in"
+        case kAudioDeviceTransportTypeBluetooth: "bluetooth"
+        case kAudioDeviceTransportTypeBluetoothLE: "bluetooth le"
+        case kAudioDeviceTransportTypeUSB: "usb"
+        case kAudioDeviceTransportTypeHDMI: "hdmi"
+        case kAudioDeviceTransportTypeDisplayPort: "displayport"
+        case kAudioDeviceTransportTypeVirtual: "virtual"
+        case kAudioDeviceTransportTypeAirPlay: "airplay"
+        case kAudioDeviceTransportTypeThunderbolt: "thunderbolt"
+        default: "other"
         }
     }
 
-    var formattedRate: String {
-        rate >= 1000 ? String(format: "%.1f kHz", rate / 1000) : "\(Int(rate)) Hz"
-    }
+    var formattedRate: String { rate >= 1000 ? String(format: "%.1f kHz", rate / 1000) : "\(Int(rate)) Hz" }
 }
 
-// ─── CoreAudio ──────────────────────────────────────────
+// MARK: - Core Audio
 
 enum CA {
-    static func devices() -> [Device] {
+    static func devices(input: Bool) -> [Device] {
         var size: UInt32 = 0
-        var addr = propAddr(kAudioHardwarePropertyDevices)
+        var addr = addr(kAudioHardwarePropertyDevices)
         guard AudioObjectGetPropertyDataSize(AudioObjectID(kAudioObjectSystemObject), &addr, 0, nil, &size) == noErr else { return [] }
-
-        let count = Int(size) / MemoryLayout<AudioDeviceID>.size
-        var ids = [AudioDeviceID](repeating: 0, count: count)
+        var ids = [AudioDeviceID](repeating: 0, count: Int(size) / MemoryLayout<AudioDeviceID>.size)
         guard AudioObjectGetPropertyData(AudioObjectID(kAudioObjectSystemObject), &addr, 0, nil, &size, &ids) == noErr else { return [] }
-
-        let defID = defaultOutputID()
-        return ids.compactMap { id -> Device? in
+        let defID = defaultID(input: input)
+        return ids.compactMap { id in
             var ss: UInt32 = 0
-            var sa = AudioObjectPropertyAddress(mSelector: kAudioDevicePropertyStreams, mScope: kAudioObjectPropertyScopeOutput, mElement: kAudioObjectPropertyElementMain)
+            var sa = AudioObjectPropertyAddress(mSelector: kAudioDevicePropertyStreams, mScope: input ? kAudioObjectPropertyScopeInput : kAudioObjectPropertyScopeOutput, mElement: kAudioObjectPropertyElementMain)
             AudioObjectGetPropertyDataSize(id, &sa, 0, nil, &ss)
             guard ss > 0 else { return nil }
-
             let name = strProp(id, kAudioObjectPropertyName)
-            guard !name.isEmpty, !name.contains("eqMac Export") else { return nil }
-
-            return Device(
-                id: id,
-                uid: strProp(id, kAudioDevicePropertyDeviceUID),
-                name: name,
-                transport: u32Prop(id, kAudioDevicePropertyTransportType),
-                rate: f64Prop(id, kAudioDevicePropertyNominalSampleRate),
-                isDefault: id == defID
-            )
+            guard !name.isEmpty, !name.contains("eqMac Export"), !name.hasPrefix("patchbay") else { return nil }
+            return Device(id: id, uid: strProp(id, kAudioDevicePropertyDeviceUID), name: name,
+                          transport: u32Prop(id, kAudioDevicePropertyTransportType),
+                          rate: f64Prop(id, kAudioDevicePropertyNominalSampleRate), isInput: input, isDefault: id == defID)
         }
     }
 
-    static func defaultOutputID() -> AudioDeviceID {
+    static func defaultID(input: Bool) -> AudioDeviceID {
         var id: AudioDeviceID = 0
         var s = UInt32(MemoryLayout<AudioDeviceID>.size)
-        var a = propAddr(kAudioHardwarePropertyDefaultOutputDevice)
+        var a = addr(input ? kAudioHardwarePropertyDefaultInputDevice : kAudioHardwarePropertyDefaultOutputDevice)
         AudioObjectGetPropertyData(AudioObjectID(kAudioObjectSystemObject), &a, 0, nil, &s, &id)
         return id
     }
 
-    @discardableResult
-    static func setDefault(_ id: AudioDeviceID) -> (out: OSStatus, sys: OSStatus, verified: Bool) {
+    static func setDefault(_ id: AudioDeviceID, input: Bool) {
         var d = id
         let s = UInt32(MemoryLayout<AudioDeviceID>.size)
-        var a1 = propAddr(kAudioHardwarePropertyDefaultOutputDevice)
-        var a2 = propAddr(kAudioHardwarePropertyDefaultSystemOutputDevice)
-        let r1 = AudioObjectSetPropertyData(AudioObjectID(kAudioObjectSystemObject), &a1, 0, nil, s, &d)
-        let r2 = AudioObjectSetPropertyData(AudioObjectID(kAudioObjectSystemObject), &a2, 0, nil, s, &d)
-        let actual = defaultOutputID()
-        return (r1, r2, actual == id)
+        if input {
+            var a = addr(kAudioHardwarePropertyDefaultInputDevice)
+            AudioObjectSetPropertyData(AudioObjectID(kAudioObjectSystemObject), &a, 0, nil, s, &d)
+        } else {
+            var a1 = addr(kAudioHardwarePropertyDefaultOutputDevice)
+            var a2 = addr(kAudioHardwarePropertyDefaultSystemOutputDevice)
+            AudioObjectSetPropertyData(AudioObjectID(kAudioObjectSystemObject), &a1, 0, nil, s, &d)
+            AudioObjectSetPropertyData(AudioObjectID(kAudioObjectSystemObject), &a2, 0, nil, s, &d)
+        }
+    }
+
+    static func volume(_ id: AudioDeviceID, input: Bool) -> Float? {
+        let scope = input ? kAudioObjectPropertyScopeInput : kAudioObjectPropertyScopeOutput
+        for element: UInt32 in [kAudioObjectPropertyElementMain, 1] {
+            var a = AudioObjectPropertyAddress(mSelector: kAudioDevicePropertyVolumeScalar, mScope: scope, mElement: element)
+            guard AudioObjectHasProperty(id, &a) else { continue }
+            var v: Float32 = 0
+            var s = UInt32(MemoryLayout<Float32>.size)
+            if AudioObjectGetPropertyData(id, &a, 0, nil, &s, &v) == noErr { return v }
+        }
+        return nil
+    }
+
+    static func setVolume(_ id: AudioDeviceID, input: Bool, _ value: Float) {
+        let scope = input ? kAudioObjectPropertyScopeInput : kAudioObjectPropertyScopeOutput
+        var v = value
+        var any = false
+        for element: UInt32 in [kAudioObjectPropertyElementMain, 1, 2] {
+            var a = AudioObjectPropertyAddress(mSelector: kAudioDevicePropertyVolumeScalar, mScope: scope, mElement: element)
+            guard AudioObjectHasProperty(id, &a) else { continue }
+            if AudioObjectSetPropertyData(id, &a, 0, nil, UInt32(MemoryLayout<Float32>.size), &v) == noErr { any = true }
+            if element == kAudioObjectPropertyElementMain, any { break }
+        }
     }
 
     static func bestReal(from devs: [Device]) -> Device? {
@@ -116,51 +131,58 @@ enum CA {
             ?? real.first
     }
 
-    // helpers
     static func addr(_ sel: AudioObjectPropertySelector) -> AudioObjectPropertyAddress {
         AudioObjectPropertyAddress(mSelector: sel, mScope: kAudioObjectPropertyScopeGlobal, mElement: kAudioObjectPropertyElementMain)
     }
-    private static func propAddr(_ sel: AudioObjectPropertySelector) -> AudioObjectPropertyAddress { addr(sel) }
     private static func strProp(_ id: AudioDeviceID, _ sel: AudioObjectPropertySelector) -> String {
-        var a = propAddr(sel); var v: CFString = "" as CFString; var s = UInt32(MemoryLayout<CFString>.size)
+        var a = addr(sel); var v: CFString = "" as CFString; var s = UInt32(MemoryLayout<CFString>.size)
         guard AudioObjectGetPropertyData(id, &a, 0, nil, &s, &v) == noErr else { return "" }
         return v as String
     }
     private static func u32Prop(_ id: AudioDeviceID, _ sel: AudioObjectPropertySelector) -> UInt32 {
-        var a = propAddr(sel); var v: UInt32 = 0; var s = UInt32(MemoryLayout<UInt32>.size)
+        var a = addr(sel); var v: UInt32 = 0; var s = UInt32(MemoryLayout<UInt32>.size)
         AudioObjectGetPropertyData(id, &a, 0, nil, &s, &v); return v
     }
     private static func f64Prop(_ id: AudioDeviceID, _ sel: AudioObjectPropertySelector) -> Double {
-        var a = propAddr(sel); var v: Float64 = 0; var s = UInt32(MemoryLayout<Float64>.size)
+        var a = addr(sel); var v: Float64 = 0; var s = UInt32(MemoryLayout<Float64>.size)
         AudioObjectGetPropertyData(id, &a, 0, nil, &s, &v); return v
     }
 }
 
-// ─── State ──────────────────────────────────────────────
+// MARK: - App state
 
 enum Action: Equatable { case fix, restart, reset, rack }
 
 final class AudioState: ObservableObject {
-    @Published var devices: [Device] = []
+    @Published var outputs: [Device] = []
+    @Published var inputs: [Device] = []
     @Published var eqMacOn = false
     @Published var active: Action? = nil
     @Published var healthy = true
     @Published var rack = RackSettings.neutral
     @Published var rackOn = false
     @Published var rackStatus: SystemAudioEngine.Status = .stopped
-    @Published var rackPeak: Float = 0
+    @Published var inputPeak: Float = 0
+    @Published var outputPeak: Float = 0
+    @Published var selectedModule: UUID?
+    @Published var inputVolume: Float = 1
+    @Published var outputVolume: Float?
+    @Published var diagnostics = SystemAudioEngine.Diagnostics()
+    @Published var notice: String?
 
-    var real: [Device] { devices.filter { !$0.isEqMac } }
-    var current: Device? { devices.first { $0.isDefault } }
+    let autoEQ = AutoEQCatalog()
+
+    var currentOutput: Device? { outputs.first { $0.isDefault } }
+    var currentInput: Device? { inputs.first { $0.isDefault } }
     var rackTarget: Device? {
-        if let current, !current.isEqMac { return current }
-        return CA.bestReal(from: devices)
+        if let currentOutput, !currentOutput.isEqMac { return currentOutput }
+        return CA.bestReal(from: outputs)
     }
+    var selected: RackModule? { rack.modules.first { $0.id == selectedModule } }
 
     private var timer: Timer?
     private var meterTimer: Timer?
-    private var outputListener: AudioObjectPropertyListenerBlock?
-    private var devicesListener: AudioObjectPropertyListenerBlock?
+    private var listeners: [(AudioObjectPropertySelector, AudioObjectPropertyListenerBlock)] = []
     private var wakeObserver: NSObjectProtocol?
     private let rackStore = RackSettingsStore()
     private let engine = SystemAudioEngine()
@@ -168,63 +190,58 @@ final class AudioState: ObservableObject {
     var onHealth: ((Bool) -> Void)?
 
     init() {
-        engine.onStatus = { [weak self] status in self?.rackStatus = status }
+        engine.tapMode = tapMode
+        engine.onStatus = { [weak self] status in
+            self?.rackStatus = status
+            self?.diagnostics = self?.engine.diagnostics ?? .init()
+        }
+        engine.onNeedsRestart = { [weak self] in
+            guard let self, self.rackOn, let target = self.rackTarget else { return }
+            self.engine.start(output: target, settings: self.rack)
+        }
         refresh()
-        installListeners()
-        timer = Timer.scheduledTimer(withTimeInterval: 10, repeats: true) { [weak self] _ in
-            DispatchQueue.main.async { self?.updateHealth() }
+        selectedModule = rack.modules.first?.id
+        for sel in [kAudioHardwarePropertyDefaultOutputDevice, kAudioHardwarePropertyDefaultInputDevice, kAudioHardwarePropertyDevices] {
+            var a = CA.addr(sel)
+            let block: AudioObjectPropertyListenerBlock = { [weak self] _, _ in DispatchQueue.main.async { self?.refresh() } }
+            AudioObjectAddPropertyListenerBlock(AudioObjectID(kAudioObjectSystemObject), &a, nil, block)
+            listeners.append((sel, block))
         }
-        meterTimer = Timer.scheduledTimer(withTimeInterval: 0.05, repeats: true) { [weak self] _ in
+        timer = Timer.scheduledTimer(withTimeInterval: 10, repeats: true) { [weak self] _ in DispatchQueue.main.async { self?.updateHealth() } }
+        meterTimer = Timer.scheduledTimer(withTimeInterval: 1.0 / 30, repeats: true) { [weak self] _ in
             guard let self else { return }
-            self.rackPeak = self.rackOn ? self.engine.peak : 0
+            self.inputPeak = self.rackOn ? self.engine.inputPeak : 0
+            self.outputPeak = self.rackOn ? self.engine.outputPeak : 0
         }
-        wakeObserver = NSWorkspace.shared.notificationCenter.addObserver(
-            forName: NSWorkspace.didWakeNotification,
-            object: nil,
-            queue: .main
-        ) { [weak self] _ in
+        wakeObserver = NSWorkspace.shared.notificationCenter.addObserver(forName: NSWorkspace.didWakeNotification, object: nil, queue: .main) { [weak self] _ in
             guard let self, self.rackOn, let target = self.rackTarget else { return }
             self.engine.start(output: target, settings: self.rack)
         }
     }
+    @Published var tapMode: SystemAudioEngine.TapMode = SystemAudioEngine.TapMode(rawValue: UserDefaults.standard.string(forKey: "tapMode") ?? "") ?? .mixdown {
+        didSet {
+            UserDefaults.standard.set(tapMode.rawValue, forKey: "tapMode")
+            engine.tapMode = tapMode
+            if rackOn, let target = rackTarget { engine.start(output: target, settings: rack) }
+        }
+    }
 
     deinit {
-        timer?.invalidate()
-        meterTimer?.invalidate()
-        engine.stop()
+        timer?.invalidate(); meterTimer?.invalidate(); engine.stop()
         if let wakeObserver { NSWorkspace.shared.notificationCenter.removeObserver(wakeObserver) }
-        if let outputListener {
-            var address = CA.addr(kAudioHardwarePropertyDefaultOutputDevice)
-            AudioObjectRemovePropertyListenerBlock(
-                AudioObjectID(kAudioObjectSystemObject), &address, nil, outputListener)
-        }
-        if let devicesListener {
-            var address = CA.addr(kAudioHardwarePropertyDevices)
-            AudioObjectRemovePropertyListenerBlock(
-                AudioObjectID(kAudioObjectSystemObject), &address, nil, devicesListener)
+        for (sel, block) in listeners {
+            var a = CA.addr(sel)
+            AudioObjectRemovePropertyListenerBlock(AudioObjectID(kAudioObjectSystemObject), &a, nil, block)
         }
     }
 
-    private func installListeners() {
-        var outputAddress = CA.addr(kAudioHardwarePropertyDefaultOutputDevice)
-        let outputBlock: AudioObjectPropertyListenerBlock = { [weak self] _, _ in
-            DispatchQueue.main.async { self?.refresh() }
-        }
-        outputListener = outputBlock
-        AudioObjectAddPropertyListenerBlock(
-            AudioObjectID(kAudioObjectSystemObject), &outputAddress, nil, outputBlock)
-
-        var devicesAddress = CA.addr(kAudioHardwarePropertyDevices)
-        let devicesBlock: AudioObjectPropertyListenerBlock = { [weak self] _, _ in
-            DispatchQueue.main.async { self?.refresh() }
-        }
-        devicesListener = devicesBlock
-        AudioObjectAddPropertyListenerBlock(
-            AudioObjectID(kAudioObjectSystemObject), &devicesAddress, nil, devicesBlock)
-    }
+    // MARK: Devices
 
     func refresh() {
-        devices = CA.devices()
+        outputs = CA.devices(input: false)
+        inputs = CA.devices(input: true)
+        if let input = currentInput { inputVolume = CA.volume(input.id, input: true) ?? 1 }
+        if let output = currentOutput { outputVolume = CA.volume(output.id, input: false) }
         eqMacOn = Self.alive("eqMac")
         updateHealth()
         synchronizeRackDevice()
@@ -233,69 +250,63 @@ final class AudioState: ObservableObject {
     private func updateHealth() {
         eqMacOn = Self.alive("eqMac")
         let was = healthy
-        healthy = !((!eqMacOn) && (current?.isEqMac == true))
+        healthy = !((!eqMacOn) && (currentOutput?.isEqMac == true))
         if was != healthy { onHealth?(healthy) }
     }
 
     private func synchronizeRackDevice() {
         guard let target = rackTarget else {
-            if rackOn {
-                engine.stop()
-                rackStatus = .failed("No physical output device is available.")
-            }
+            if rackOn { engine.stop(); rackStatus = .failed("No physical output device is available.") }
             return
         }
-
         if rackDeviceUID != target.uid {
             rackDeviceUID = target.uid
             var loaded = rackStore.settings(for: target.uid)
             loaded.enabled = rackOn
             rack = loaded
+            if selected == nil { selectedModule = rack.modules.first?.id }
         }
-
         guard rackOn, active != .rack, engine.outputUID != target.uid else { return }
         engine.start(output: target, settings: rack)
     }
 
-    func switchTo(_ device: Device) {
-        if rackOn && device.isEqMac {
-            setRackOn(false)
+    func select(_ device: Device) {
+        if device.isInput {
+            CA.setDefault(device.id, input: true)
+            DispatchQueue.main.asyncAfter(deadline: .now() + 0.2) { self.refresh() }
+            return
         }
+        if rackOn && device.isEqMac { setRackOn(false) }
         engine.stop()
-        CA.setDefault(device.id)
+        CA.setDefault(device.id, input: false)
         DispatchQueue.main.asyncAfter(deadline: .now() + 0.3) {
             self.refresh()
-            if self.rackOn, let target = self.rackTarget {
-                self.engine.start(output: target, settings: self.rack)
-            }
+            if self.rackOn, let target = self.rackTarget { self.engine.start(output: target, settings: self.rack) }
         }
     }
+
+    func setInputVolume(_ value: Float) {
+        inputVolume = value
+        if let input = currentInput { CA.setVolume(input.id, input: true, value) }
+    }
+
+    func setOutputVolume(_ value: Float) {
+        outputVolume = value
+        if let output = currentOutput { CA.setVolume(output.id, input: false, value) }
+    }
+
+    // MARK: Rack lifecycle
 
     func setRackOn(_ enabled: Bool) {
         guard enabled != rackOn else { return }
         if !enabled {
-            rackOn = false
-            rack.enabled = false
-            persistRack()
-            engine.stop()
-            return
+            rackOn = false; rack.enabled = false; persistRack(); engine.stop(); return
         }
-
-        guard let target = rackTarget else {
-            rackStatus = .failed("No physical output device is available.")
-            return
-        }
-
-        rackOn = true
-        rack.enabled = true
-        persistRack()
-        active = .rack
+        guard let target = rackTarget else { rackStatus = .failed("No physical output device is available."); return }
+        rackOn = true; rack.enabled = true; persistRack(); active = .rack
         bg {
-            if Self.alive("eqMac") {
-                Self.kill("eqMac")
-                usleep(500_000)
-            }
-            CA.setDefault(target.id)
+            if Self.alive("eqMac") { Self.kill("eqMac"); usleep(500_000) }
+            CA.setDefault(target.id, input: false)
             DispatchQueue.main.async {
                 self.refresh()
                 self.engine.start(output: target, settings: self.rack)
@@ -304,59 +315,122 @@ final class AudioState: ObservableObject {
         }
     }
 
-    func setPreamp(_ value: Double) {
-        updateRack { $0.preampDB = value }
+    func setBypass(_ bypass: Bool) { update { $0.bypass = bypass } }
+
+    // MARK: Rack editing
+
+    func addModule(_ kind: ModuleKind) {
+        guard rack.modules.count < Int(PB_MAX_MODULES) else { notice = "Rack is full (\(PB_MAX_MODULES) modules)."; return }
+        let module = RackModule(kind: kind)
+        update { $0.modules.append(module) }
+        selectedModule = module.id
     }
 
-    func setBalance(_ value: Double) {
-        updateRack { $0.balance = value }
+    func removeModule(_ id: UUID) {
+        update { $0.modules.removeAll { $0.id == id } }
+        if selectedModule == id { selectedModule = rack.modules.first?.id }
     }
 
-    func setLimiterThreshold(_ value: Double) {
-        updateRack { $0.limiterThresholdDB = value }
+    func moveModule(from source: IndexSet, to destination: Int) {
+        update { $0.modules.move(fromOffsets: source, toOffset: destination) }
     }
 
-    func setBandEnabled(_ id: UUID, _ enabled: Bool) {
-        updateBand(id) { $0.enabled = enabled }
+    func moveModule(_ id: UUID, by offset: Int) {
+        guard let index = rack.modules.firstIndex(where: { $0.id == id }) else { return }
+        let dest = index + offset
+        guard rack.modules.indices.contains(dest) else { return }
+        update { $0.modules.swapAt(index, dest) }
     }
 
-    func setBandType(_ id: UUID, _ type: FilterType) {
-        updateBand(id) { $0.type = type }
+    func setModuleEnabled(_ id: UUID, _ enabled: Bool) { updateModule(id) { $0.enabled = enabled } }
+    func setParam(_ id: UUID, _ key: String, _ value: Double) { updateModule(id) { $0.params[key] = value } }
+    func setBand(_ id: UUID, _ bandID: UUID, _ mutate: (inout EQBand) -> Void) {
+        updateModule(id) { module in
+            guard let i = module.bands.firstIndex(where: { $0.id == bandID }) else { return }
+            mutate(&module.bands[i])
+        }
     }
-
-    func setBandFrequency(_ id: UUID, _ frequency: Double) {
-        updateBand(id) { $0.frequency = frequency }
+    func addBand(_ id: UUID) {
+        updateModule(id) { module in
+            guard module.bands.count < 32 else { return }
+            module.bands.append(EQBand(type: .peaking, frequency: 1_000, gainDB: 0, q: 1))
+        }
     }
-
-    func setBandGain(_ id: UUID, _ gain: Double) {
-        updateBand(id) { $0.gainDB = gain }
-    }
-
-    func setBandQ(_ id: UUID, _ q: Double) {
-        updateBand(id) { $0.q = q }
-    }
-
-    func moveModule(at index: Int, by offset: Int) {
-        let destination = index + offset
-        guard rack.modules.indices.contains(index), rack.modules.indices.contains(destination) else { return }
-        updateRack { $0.modules.swapAt(index, destination) }
+    func removeBand(_ id: UUID, _ bandID: UUID) { updateModule(id) { $0.bands.removeAll { $0.id == bandID } } }
+    func resetModule(_ id: UUID) {
+        updateModule(id) { module in
+            module.params = module.kind.defaults
+            module.bands = module.kind.defaultBands
+            module.name = nil
+        }
     }
 
     func resetRack() {
         var neutral = RackSettings.neutral
         neutral.enabled = rackOn
         rack = neutral
+        selectedModule = rack.modules.first?.id
         persistRack()
         engine.publish(rack)
     }
 
-    private func updateBand(_ id: UUID, _ mutation: (inout EQBand) -> Void) {
-        guard let index = rack.bands.firstIndex(where: { $0.id == id }) else { return }
-        updateRack { mutation(&$0.bands[index]) }
+    // MARK: Presets, import, export
+
+    func applyPreset(_ preset: ParametricPreset, name: String, replacing id: UUID? = nil) {
+        var module = RackModule(kind: .parametricEQ, name: name)
+        module.params["preamp"] = preset.preampDB
+        module.bands = preset.bands
+        if let id, let index = rack.modules.firstIndex(where: { $0.id == id }) {
+            module.id = id
+            update { $0.modules[index] = module }
+        } else {
+            guard rack.modules.count < Int(PB_MAX_MODULES) else { notice = "Rack is full."; return }
+            update { $0.modules.insert(module, at: 0) }
+        }
+        selectedModule = module.id
     }
 
-    private func updateRack(_ mutation: (inout RackSettings) -> Void) {
-        mutation(&rack)
+    func importParametricFile() {
+        let panel = NSOpenPanel()
+        panel.allowedContentTypes = [.plainText, .text]
+        panel.message = "Choose an Equalizer APO / AutoEq ParametricEQ.txt"
+        guard panel.runModal() == .OK, let url = panel.url, let text = try? String(contentsOf: url, encoding: .utf8) else { return }
+        guard let preset = ParametricPreset.parse(text) else { notice = "No filters found in that file."; return }
+        applyPreset(preset, name: url.deletingPathExtension().lastPathComponent, replacing: selected?.kind == .parametricEQ ? selected?.id : nil)
+    }
+
+    func exportParametricFile(_ id: UUID) {
+        guard let module = rack.modules.first(where: { $0.id == id }) else { return }
+        let panel = NSSavePanel()
+        panel.nameFieldStringValue = "\(module.title) ParametricEQ.txt"
+        panel.allowedContentTypes = [.plainText]
+        guard panel.runModal() == .OK, let url = panel.url else { return }
+        let preset = ParametricPreset(preampDB: module.param("preamp"), bands: module.bands)
+        try? preset.exportText.write(to: url, atomically: true, encoding: .utf8)
+    }
+
+    func applyAutoEQ(_ entry: AutoEQCatalog.Entry) {
+        autoEQ.fetchProfile(entry) { [weak self] result in
+            guard let self else { return }
+            switch result {
+            case .success(let preset):
+                let existing = self.rack.modules.first { $0.name?.hasPrefix("AutoEq") == true }
+                self.applyPreset(preset, name: "AutoEq · \(entry.name)", replacing: existing?.id)
+            case .failure(let error):
+                self.notice = "Could not fetch profile: \(error.localizedDescription)"
+            }
+        }
+    }
+
+    // MARK: Internals
+
+    private func updateModule(_ id: UUID, _ mutate: (inout RackModule) -> Void) {
+        guard let index = rack.modules.firstIndex(where: { $0.id == id }) else { return }
+        update { mutate(&$0.modules[index]) }
+    }
+
+    private func update(_ mutate: (inout RackSettings) -> Void) {
+        mutate(&rack)
         persistRack()
         engine.publish(rack)
     }
@@ -366,22 +440,16 @@ final class AudioState: ObservableObject {
         rackStore.save(rack, for: uid)
     }
 
+    // MARK: eqMac recovery
+
     func fixAudio() {
         guard active == nil else { return }
         active = .fix
         bg {
-            let eqMacInvolved = Self.alive("eqMac")
-                || CA.devices().first(where: { $0.isDefault })?.isEqMac == true
-            Self.kill("eqMac")
-            sleep(2)
-            if let best = CA.bestReal(from: CA.devices()) { CA.setDefault(best.id) }
-            if eqMacInvolved {
-                sleep(1)
-                self.launchEqMac()
-                sleep(6)
-            } else {
-                usleep(500_000)
-            }
+            let involved = Self.alive("eqMac") || CA.devices(input: false).first(where: { $0.isDefault })?.isEqMac == true
+            Self.kill("eqMac"); sleep(2)
+            if let best = CA.bestReal(from: CA.devices(input: false)) { CA.setDefault(best.id, input: false) }
+            if involved { sleep(1); self.launchEqMac(); sleep(6) } else { usleep(500_000) }
             DispatchQueue.main.async { self.refresh(); self.active = nil }
         }
     }
@@ -391,295 +459,100 @@ final class AudioState: ObservableObject {
         if rackOn { setRackOn(false) }
         active = .restart
         bg {
-            Self.kill("eqMac")
-            sleep(2)
-            if let best = CA.bestReal(from: CA.devices()) { CA.setDefault(best.id) }
-            sleep(1)
-            self.launchEqMac()
-            sleep(6)
+            Self.kill("eqMac"); sleep(2)
+            if let best = CA.bestReal(from: CA.devices(input: false)) { CA.setDefault(best.id, input: false) }
+            sleep(1); self.launchEqMac(); sleep(6)
             DispatchQueue.main.async { self.refresh(); self.active = nil }
         }
     }
 
     func resetCA() {
         guard active == nil else { return }
-        let restartRackAfterReset = rackOn
+        let resume = rackOn
         if rackOn { setRackOn(false) }
         active = .reset
         bg {
-            let eqMacWasRunning = Self.alive("eqMac")
-            let script = NSAppleScript(
-                source: #"do shell script "killall coreaudiod" with administrator privileges"#)
+            let hadEqMac = Self.alive("eqMac")
+            let script = NSAppleScript(source: #"do shell script "killall coreaudiod" with administrator privileges"#)
             var error: NSDictionary?
             script?.executeAndReturnError(&error)
-            if error != nil {
-                DispatchQueue.main.async { self.active = nil }
-                return
-            }
+            if error != nil { DispatchQueue.main.async { self.active = nil }; return }
             sleep(3)
-            if eqMacWasRunning {
-                Self.kill("eqMac")
-                sleep(1)
-                if let best = CA.bestReal(from: CA.devices()) { CA.setDefault(best.id) }
-                sleep(1)
-                self.launchEqMac()
-                sleep(6)
+            if hadEqMac {
+                Self.kill("eqMac"); sleep(1)
+                if let best = CA.bestReal(from: CA.devices(input: false)) { CA.setDefault(best.id, input: false) }
+                sleep(1); self.launchEqMac(); sleep(6)
             }
-            DispatchQueue.main.async {
-                self.refresh()
-                self.active = nil
-                if restartRackAfterReset { self.setRackOn(true) }
-            }
+            DispatchQueue.main.async { self.refresh(); self.active = nil; if resume { self.setRackOn(true) } }
         }
     }
 
     private func launchEqMac() {
         DispatchQueue.main.async {
-            NSWorkspace.shared.openApplication(
-                at: URL(fileURLWithPath: "/Applications/eqMac.app"),
-                configuration: NSWorkspace.OpenConfiguration()
-            ) { _, _ in }
+            NSWorkspace.shared.openApplication(at: URL(fileURLWithPath: "/Applications/eqMac.app"), configuration: NSWorkspace.OpenConfiguration()) { _, _ in }
         }
     }
 
-    private func bg(_ work: @escaping () -> Void) {
-        DispatchQueue.global(qos: .userInitiated).async(execute: work)
-    }
+    private func bg(_ work: @escaping () -> Void) { DispatchQueue.global(qos: .userInitiated).async(execute: work) }
 
     private static func alive(_ name: String) -> Bool {
-        let process = Process()
-        process.executableURL = URL(fileURLWithPath: "/usr/bin/pgrep")
-        process.arguments = ["-x", name]
-        process.standardOutput = FileHandle.nullDevice
-        process.standardError = FileHandle.nullDevice
-        try? process.run()
-        process.waitUntilExit()
-        return process.terminationStatus == 0
+        let p = Process(); p.executableURL = URL(fileURLWithPath: "/usr/bin/pgrep"); p.arguments = ["-x", name]
+        p.standardOutput = FileHandle.nullDevice; p.standardError = FileHandle.nullDevice
+        try? p.run(); p.waitUntilExit(); return p.terminationStatus == 0
     }
-
     private static func kill(_ name: String) {
-        let process = Process()
-        process.executableURL = URL(fileURLWithPath: "/usr/bin/pkill")
-        process.arguments = ["-9", "-x", name]
-        process.standardOutput = FileHandle.nullDevice
-        process.standardError = FileHandle.nullDevice
-        try? process.run()
-        process.waitUntilExit()
+        let p = Process(); p.executableURL = URL(fileURLWithPath: "/usr/bin/pkill"); p.arguments = ["-9", "-x", name]
+        p.standardOutput = FileHandle.nullDevice; p.standardError = FileHandle.nullDevice
+        try? p.run(); p.waitUntilExit()
     }
 }
 
-// ─── Colors ─────────────────────────────────────────────
+// MARK: - Status bar
 
-extension Color {
-    static let amber  = Color(red: 0.77, green: 0.60, blue: 0.35)
-    static let sage   = Color(red: 0.48, green: 0.58, blue: 0.42)
-}
-
-// ─── Styles ─────────────────────────────────────────────
-
-struct Tap: ButtonStyle {
-    func makeBody(configuration: Configuration) -> some View {
-        configuration.label
-            .scaleEffect(configuration.isPressed ? 0.97 : 1)
-            .opacity(configuration.isPressed ? 0.7 : 1)
-            .animation(.easeOut(duration: 0.12), value: configuration.isPressed)
-    }
-}
-
-// ─── Views ──────────────────────────────────────────────
-
-struct PopoverBody: View {
-    @ObservedObject var audio: AudioState
-    let openRack: () -> Void
-
-    var body: some View {
-        VStack(alignment: .leading, spacing: 0) {
-
-            VStack(alignment: .leading, spacing: 0) {
-                ForEach(audio.devices) { dev in
-                    DeviceRow(device: dev) { audio.switchTo(dev) }
-                }
-            }
-            .padding(.top, 8)
-
-            Color.clear.frame(height: 4)
-            RackSummary(audio: audio, open: openRack)
-            Color.clear.frame(height: 4)
-
-            VStack(spacing: 0) {
-                Act("Fix audio",       "wrench.fill",       .fix,     audio) { audio.fixAudio() }
-                Act("Restart eqMac",   "arrow.clockwise",   .restart, audio) { audio.restartEqMac() }
-                Act("Reset core audio","bolt.fill",          .reset,   audio) { audio.resetCA() }
-            }
-
-            Color.clear.frame(height: 8)
-
-            HStack(spacing: 5) {
-                Circle()
-                    .fill(audio.eqMacOn ? Color.sage : Color.secondary.opacity(0.25))
-                    .frame(width: 5, height: 5)
-                Text("eqMac \(audio.eqMacOn ? "on" : "off")")
-                    .font(.system(size: 10, design: .monospaced))
-                    .foregroundStyle(.tertiary)
-                Spacer()
-                Button("Quit") { NSApp.terminate(nil) }
-                    .font(.system(size: 10))
-                    .foregroundStyle(.tertiary)
-                    .buttonStyle(.plain)
-            }
-            .padding(.horizontal, 14)
-            .padding(.bottom, 8)
-        }
-        .frame(width: 280)
-    }
-}
-
-
-struct DeviceRow: View {
-    let device: Device
-    let action: () -> Void
-    @State private var hover = false
-
-    var body: some View {
-        Button(action: action) {
-            HStack(spacing: 8) {
-                RoundedRectangle(cornerRadius: 1)
-                    .fill(device.isDefault ? Color.amber : Color.clear)
-                    .frame(width: 3, height: device.isDefault ? 32 : 22)
-                    .animation(.easeOut(duration: 0.2), value: device.isDefault)
-
-                Image(systemName: device.icon)
-                    .font(.system(size: 12, weight: device.isDefault ? .medium : .regular))
-                    .foregroundStyle(device.isDefault ? .primary : .tertiary)
-                    .frame(width: 18)
-
-                VStack(alignment: .leading, spacing: 2) {
-                    Text(device.name)
-                        .font(.system(size: 13, weight: device.isDefault ? .medium : .regular))
-                        .foregroundStyle(device.isDefault ? .primary : .secondary)
-                    Text("\(device.formattedRate)  \(device.transportLabel)")
-                        .font(.system(size: 10, design: .monospaced))
-                        .foregroundStyle(device.isDefault ? .secondary : .quaternary)
-                }
-
-                Spacer()
-            }
-            .contentShape(Rectangle())
-            .padding(.horizontal, 8)
-            .padding(.vertical, 5)
-            .background(
-                RoundedRectangle(cornerRadius: 5)
-                    .fill(hover ? Color.primary.opacity(0.07) : Color.clear)
-                    .animation(.easeOut(duration: 0.15), value: hover)
-            )
-        }
-        .buttonStyle(Tap())
-        .onHover { hover = $0 }
-        .padding(.horizontal, 2)
-    }
-}
-
-struct Act: View {
-    let label: String
-    let icon: String
-    let kind: Action
-    @ObservedObject var audio: AudioState
-    let action: () -> Void
-    @State private var hover = false
-
-    init(_ label: String, _ icon: String, _ kind: Action, _ audio: AudioState, action: @escaping () -> Void) {
-        self.label = label; self.icon = icon; self.kind = kind; self.audio = audio; self.action = action
-    }
-
-    var body: some View {
-        Button(action: action) {
-            HStack(spacing: 8) {
-                Image(systemName: icon)
-                    .font(.system(size: 11))
-                    .foregroundStyle(hover ? .primary : .secondary)
-                    .frame(width: 16)
-                    .animation(.easeOut(duration: 0.15), value: hover)
-                Text(label)
-                    .font(.system(size: 13))
-                    .foregroundStyle(audio.active != nil && audio.active != kind ? .tertiary : .primary)
-                Spacer()
-                if audio.active == kind {
-                    ProgressView()
-                        .controlSize(.small)
-                        .scaleEffect(0.6)
-                        .frame(width: 14, height: 14)
-                }
-            }
-            .contentShape(Rectangle())
-            .padding(.horizontal, 12)
-            .padding(.vertical, 6)
-            .background(
-                RoundedRectangle(cornerRadius: 5)
-                    .fill(hover ? Color.primary.opacity(0.07) : Color.clear)
-                    .animation(.easeOut(duration: 0.15), value: hover)
-            )
-        }
-        .buttonStyle(Tap())
-        .disabled(audio.active != nil)
-        .onHover { hover = $0 }
-        .padding(.horizontal, 2)
-    }
-}
-
-// ─── Status Bar ─────────────────────────────────────────
-
-final class Bar: NSObject {
+final class Bar: NSObject, NSPopoverDelegate {
     private var item: NSStatusItem!
     private var pop: NSPopover!
     private let audio = AudioState()
     private var monitor: Any?
-    private let rackWindow = RackWindowController()
 
     override init() {
         super.init()
-
         item = NSStatusBar.system.statusItem(withLength: NSStatusItem.variableLength)
         pop = NSPopover()
-        pop.contentViewController = NSHostingController(
-            rootView: PopoverBody(audio: audio) { [weak self] in
-                guard let self else { return }
-                self.hide()
-                self.rackWindow.show(audio: self.audio)
-            }
-        )
+        pop.contentViewController = NSHostingController(rootView: Root(audio: audio))
         pop.behavior = .transient
-
+        pop.animates = true
+        pop.delegate = self
         if let b = item.button {
             b.image = NSImage(systemSymbolName: "waveform", accessibilityDescription: "patchbay")
             b.target = self
             b.action = #selector(tap)
         }
-
         audio.onHealth = { [weak self] ok in
-            self?.item.button?.image = NSImage(
-                systemSymbolName: ok ? "waveform" : "waveform.badge.exclamationmark",
-                accessibilityDescription: "patchbay"
-            )
+            self?.item.button?.image = NSImage(systemSymbolName: ok ? "waveform" : "waveform.badge.exclamationmark", accessibilityDescription: "patchbay")
         }
     }
 
     @objc private func tap() {
         if pop.isShown { hide(); return }
         audio.refresh()
-        guard let b = item.button else { return }
+        // With several displays each menu bar has its own button; anchor to the one that was clicked.
+        let clicked = NSApp.currentEvent?.window?.contentView
+        guard let b = clicked ?? item.button else { return }
         pop.show(relativeTo: b.bounds, of: b, preferredEdge: .minY)
-        monitor = NSEvent.addGlobalMonitorForEvents(matching: [.leftMouseDown, .rightMouseDown]) { [weak self] _ in
-            self?.hide()
-        }
+        pop.contentViewController?.view.window?.makeKey()
+        monitor = NSEvent.addGlobalMonitorForEvents(matching: [.leftMouseDown, .rightMouseDown]) { [weak self] _ in self?.hide() }
     }
 
     private func hide() {
         pop.performClose(nil)
         if let m = monitor { NSEvent.removeMonitor(m); monitor = nil }
     }
-}
 
-// ─── Entry ──────────────────────────────────────────────
+    func popoverDidClose(_ notification: Notification) {
+        if let m = monitor { NSEvent.removeMonitor(m); monitor = nil }
+    }
+}
 
 final class Delegate: NSObject, NSApplicationDelegate {
     var bar: Bar?

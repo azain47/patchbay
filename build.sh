@@ -31,7 +31,8 @@ swiftc \
     "$DIR/main.swift" \
     "$DIR/DSP.swift" \
     "$DIR/AudioEngine.swift" \
-    "$DIR/RackView.swift" \
+    "$DIR/UI.swift" \
+    "$DIR/AutoEQ.swift" \
     "$OBJ"
 
 cat > "$APP/Contents/Info.plist" << 'EOF'

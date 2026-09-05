@@ -19,21 +19,37 @@ final class SystemAudioEngine {
         }
     }
 
+    enum TapMode: String, CaseIterable { case mixdown, deviceStream }
+    /// Which tap topology to build. Mixdown is the conservative default; the device-stream tap
+    /// avoids a resample but is exposed as an A/B switch because behaviour differs per device.
+    var tapMode: TapMode = .mixdown
+    struct Diagnostics: Equatable {
+        var tapBinding = "—"
+        var sampleRate = 0.0
+        var driftCompensation = false
+    }
+
     var onStatus: ((Status) -> Void)?
+    var onNeedsRestart: (() -> Void)?
     private(set) var status: Status = .stopped {
         didSet { DispatchQueue.main.async { [status, weak self] in self?.onStatus?(status) } }
     }
     private(set) var outputUID: String?
     private(set) var sampleRate = 48_000.0
-    var peak: Float { processor?.peak ?? 0 }
+    private(set) var diagnostics = Diagnostics()
+    var inputPeak: Float { processor?.inputPeak ?? 0 }
+    var outputPeak: Float { processor?.outputPeak ?? 0 }
 
     private var tapID = AudioObjectID(kAudioObjectUnknown)
     private var aggregateID = AudioObjectID(kAudioObjectUnknown)
     private var ioProcID: AudioDeviceIOProcID?
     private var processor: RealtimeDSP?
     private var proofTimer: Timer?
+    private var rateListener: AudioObjectPropertyListenerBlock?
     private var settings = RackSettings.neutral
     private var generation: UInt64 = 0
+    private var layoutGeneration: UInt64 = 0
+    private var lastLayoutKey = ""
     private var captureProven = false
 
     deinit { stop() }
@@ -42,7 +58,6 @@ final class SystemAudioEngine {
         stopResources()
         self.settings = settings
         outputUID = output.uid
-
         do {
             try buildPipeline(output: output, proofOnly: !captureProven)
             if captureProven {
@@ -58,8 +73,6 @@ final class SystemAudioEngine {
     }
 
     func stop() {
-        proofTimer?.invalidate()
-        proofTimer = nil
         stopResources()
         outputUID = nil
         captureProven = false
@@ -69,16 +82,17 @@ final class SystemAudioEngine {
     func publish(_ settings: RackSettings) {
         self.settings = settings
         generation &+= 1
-        processor?.publish(settings, sampleRate: sampleRate, generation: generation)
+        let key = settings.layoutKey
+        if key != lastLayoutKey { layoutGeneration &+= 1; lastLayoutKey = key }
+        processor?.publish(settings, generation: generation, layoutGeneration: layoutGeneration)
     }
+
+    // MARK: Proof-before-mute
 
     private func beginProof(for output: Device) {
         proofTimer?.invalidate()
         proofTimer = Timer.scheduledTimer(withTimeInterval: 0.2, repeats: true) { [weak self] timer in
-            guard let self, let processor = self.processor else {
-                timer.invalidate()
-                return
-            }
+            guard let self, let processor = self.processor else { timer.invalidate(); return }
             guard processor.sawSignal != 0 else { return }
             guard processor.renderableLayout != 0 else {
                 timer.invalidate()
@@ -86,7 +100,6 @@ final class SystemAudioEngine {
                 self.status = .failed("This output layout is not stereo-renderable yet. Audio was left untouched.")
                 return
             }
-
             timer.invalidate()
             self.proofTimer = nil
             self.captureProven = true
@@ -101,21 +114,43 @@ final class SystemAudioEngine {
         }
     }
 
+    // MARK: Pipeline
+
     private func buildPipeline(output: Device, proofOnly: Bool) throws {
         var excluded: [AudioObjectID] = []
-        if let processID = try? processObjectID(for: getpid()) {
-            excluded.append(processID)
-        }
+        if let processID = try? processObjectID(for: getpid()) { excluded.append(processID) }
 
-        let description = CATapDescription(stereoGlobalTapButExcludeProcesses: excluded)
+        // Prefer a tap bound to the device's own stream: its format matches the hardware
+        // stream exactly, so Core Audio does no rate conversion between tap and output.
+        // Fall back to the global stereo mixdown when the device stream isn't plain stereo.
+        var description = CATapDescription(__excludingProcesses: excluded.map { NSNumber(value: $0) }, andDeviceUID: output.uid, withStream: 0)
+        var binding = "device stream"
         description.name = "patchbay system tap"
         description.isPrivate = true
         description.muteBehavior = proofOnly ? CATapMuteBehavior.unmuted : CATapMuteBehavior.mutedWhenTapped
 
         var newTapID = AudioObjectID(kAudioObjectUnknown)
-        try check(AudioHardwareCreateProcessTap(description, &newTapID), "creating the system tap")
+        var created = tapMode == .deviceStream && AudioHardwareCreateProcessTap(description, &newTapID) == noErr && tapIsStereoFloat(newTapID)
+        if !created {
+            if newTapID != kAudioObjectUnknown { AudioHardwareDestroyProcessTap(newTapID); newTapID = kAudioObjectUnknown }
+            description = CATapDescription(stereoGlobalTapButExcludeProcesses: excluded)
+            description.name = "patchbay system tap"
+            description.isPrivate = true
+            description.muteBehavior = proofOnly ? CATapMuteBehavior.unmuted : CATapMuteBehavior.mutedWhenTapped
+            binding = "stereo mixdown"
+            try check(AudioHardwareCreateProcessTap(description, &newTapID), "creating the system tap")
+            created = tapIsStereoFloat(newTapID)
+            guard created else {
+                AudioHardwareDestroyProcessTap(newTapID)
+                throw EngineError("the system tap did not provide stereo Float32 audio; audio was left untouched")
+            }
+        }
         tapID = newTapID
-        try requireFloatStereoTap(newTapID)
+
+        // Bluetooth: tap and output share the BT clock; drift compensation there makes the
+        // HAL insert/drop samples periodically (audible crackle). Wired/USB clocks differ.
+        let isBluetooth = output.transport == kAudioDeviceTransportTypeBluetooth || output.transport == kAudioDeviceTransportTypeBluetoothLE
+        let drift = !isBluetooth
 
         let aggregateDescription: [String: Any] = [
             kAudioAggregateDeviceNameKey: "patchbay private output",
@@ -127,60 +162,64 @@ final class SystemAudioEngine {
             kAudioAggregateDeviceSubDeviceListKey: [[kAudioSubDeviceUIDKey: output.uid]],
             kAudioAggregateDeviceTapListKey: [[
                 kAudioSubTapUIDKey: description.uuid.uuidString,
-                kAudioSubTapDriftCompensationKey: true,
+                kAudioSubTapDriftCompensationKey: drift,
+                kAudioSubTapDriftCompensationQualityKey: kAudioAggregateDriftCompensationMaxQuality,
             ]],
         ]
-
         var newAggregateID = AudioObjectID(kAudioObjectUnknown)
-        try check(
-            AudioHardwareCreateAggregateDevice(aggregateDescription as CFDictionary, &newAggregateID),
-            "creating the private output"
-        )
+        try check(AudioHardwareCreateAggregateDevice(aggregateDescription as CFDictionary, &newAggregateID), "creating the private output")
         aggregateID = newAggregateID
         try requireOutputChannels(newAggregateID)
 
         sampleRate = try nominalSampleRate(of: newAggregateID)
+        diagnostics = Diagnostics(tapBinding: binding, sampleRate: sampleRate, driftCompensation: drift)
         generation &+= 1
-        guard let newProcessor = RealtimeDSP(
-            settings: settings,
-            sampleRate: sampleRate,
-            generation: generation,
-            proofOnly: proofOnly
-        ) else {
+        layoutGeneration &+= 1
+        lastLayoutKey = settings.layoutKey
+        guard let newProcessor = RealtimeDSP(settings: settings, sampleRate: sampleRate, generation: generation, layoutGeneration: layoutGeneration, proofOnly: proofOnly) else {
             throw EngineError("allocating the realtime processor failed")
         }
         processor = newProcessor
 
         var newIOProcID: AudioDeviceIOProcID?
-        try check(
-            AudioDeviceCreateIOProcIDWithBlock(
-                &newIOProcID,
-                newAggregateID,
-                nil,
-                Self.ioBlock(for: newProcessor)
-            ),
-            "creating the realtime output callback"
-        )
+        try check(AudioDeviceCreateIOProcIDWithBlock(&newIOProcID, newAggregateID, nil, Self.ioBlock(for: newProcessor)), "creating the realtime output callback")
         ioProcID = newIOProcID
         try check(AudioDeviceStart(newAggregateID, newIOProcID), "starting the audio pipeline")
+        installRateListener(on: newAggregateID)
     }
 
     private static func ioBlock(for processor: RealtimeDSP) -> AudioDeviceIOBlock {
-        { _, input, _, output, _ in
-            processor.render(input: input, output: output)
+        { _, input, _, output, _ in processor.render(input: input, output: output) }
+    }
+
+    /// A device renegotiating its rate or channel layout invalidates the filters and the
+    /// aggregate built around it; the owner rebuilds rather than patching live state.
+    private func installRateListener(on id: AudioObjectID) {
+        var address = propertyAddress(kAudioDevicePropertyNominalSampleRate)
+        let block: AudioObjectPropertyListenerBlock = { [weak self] _, _ in
+            DispatchQueue.main.async {
+                guard let self, self.aggregateID == id else { return }
+                if let rate = try? self.nominalSampleRate(of: id), rate != self.sampleRate {
+                    self.onNeedsRestart?()
+                }
+            }
         }
+        if AudioObjectAddPropertyListenerBlock(id, &address, .main, block) == noErr { rateListener = block }
     }
 
     private func stopResources() {
         proofTimer?.invalidate()
         proofTimer = nil
-
+        if let rateListener, aggregateID != kAudioObjectUnknown {
+            var address = propertyAddress(kAudioDevicePropertyNominalSampleRate)
+            AudioObjectRemovePropertyListenerBlock(aggregateID, &address, .main, rateListener)
+        }
+        rateListener = nil
         if let ioProcID, aggregateID != kAudioObjectUnknown {
             AudioDeviceStop(aggregateID, ioProcID)
             AudioDeviceDestroyIOProcID(aggregateID, ioProcID)
         }
         ioProcID = nil
-
         if aggregateID != kAudioObjectUnknown {
             AudioHardwareDestroyAggregateDevice(aggregateID)
             aggregateID = AudioObjectID(kAudioObjectUnknown)
@@ -192,55 +231,36 @@ final class SystemAudioEngine {
         processor = nil
     }
 
+    // MARK: Core Audio helpers
+
     private func processObjectID(for pid: pid_t) throws -> AudioObjectID {
         var address = propertyAddress(kAudioHardwarePropertyTranslatePIDToProcessObject)
         var process = pid
         var object = AudioObjectID(kAudioObjectUnknown)
         var size = UInt32(MemoryLayout<AudioObjectID>.size)
-        try check(
-            AudioObjectGetPropertyData(
-                AudioObjectID(kAudioObjectSystemObject),
-                &address,
-                UInt32(MemoryLayout<pid_t>.size),
-                &process,
-                &size,
-                &object
-            ),
-            "excluding patchbay from its own tap"
-        )
+        try check(AudioObjectGetPropertyData(AudioObjectID(kAudioObjectSystemObject), &address, UInt32(MemoryLayout<pid_t>.size), &process, &size, &object), "excluding patchbay from its own tap")
         return object
     }
 
-    private func requireFloatStereoTap(_ id: AudioObjectID) throws {
+    private func tapIsStereoFloat(_ id: AudioObjectID) -> Bool {
         var address = propertyAddress(kAudioTapPropertyFormat)
         var format = AudioStreamBasicDescription()
         var size = UInt32(MemoryLayout<AudioStreamBasicDescription>.size)
-        try check(AudioObjectGetPropertyData(id, &address, 0, nil, &size, &format), "reading the tap format")
-        let isFloat32 = format.mFormatFlags & kAudioFormatFlagIsFloat != 0 && format.mBitsPerChannel == 32
-        guard isFloat32, format.mChannelsPerFrame == 2 else {
-            throw EngineError("the system tap did not provide stereo Float32 audio; audio was left untouched")
-        }
+        guard AudioObjectGetPropertyData(id, &address, 0, nil, &size, &format) == noErr else { return false }
+        return format.mFormatFlags & kAudioFormatFlagIsFloat != 0 && format.mBitsPerChannel == 32 && format.mChannelsPerFrame == 2
     }
 
     private func requireOutputChannels(_ id: AudioObjectID) throws {
-        var address = AudioObjectPropertyAddress(
-            mSelector: kAudioDevicePropertyStreamConfiguration,
-            mScope: kAudioObjectPropertyScopeOutput,
-            mElement: kAudioObjectPropertyElementMain
-        )
+        var address = AudioObjectPropertyAddress(mSelector: kAudioDevicePropertyStreamConfiguration, mScope: kAudioObjectPropertyScopeOutput, mElement: kAudioObjectPropertyElementMain)
         var size: UInt32 = 0
         try check(AudioObjectGetPropertyDataSize(id, &address, 0, nil, &size), "reading output channels")
-        guard size >= UInt32(MemoryLayout<AudioBufferList>.size) else {
-            throw EngineError("the selected device has no output channels; audio was left untouched")
-        }
+        guard size >= UInt32(MemoryLayout<AudioBufferList>.size) else { throw EngineError("the selected device has no output channels; audio was left untouched") }
         let raw = UnsafeMutableRawPointer.allocate(byteCount: Int(size), alignment: MemoryLayout<AudioBufferList>.alignment)
         defer { raw.deallocate() }
         let list = raw.bindMemory(to: AudioBufferList.self, capacity: 1)
         try check(AudioObjectGetPropertyData(id, &address, 0, nil, &size, list), "reading output channels")
         let channels = UnsafeMutableAudioBufferListPointer(list).reduce(0) { $0 + Int($1.mNumberChannels) }
-        guard channels >= 2 else {
-            throw EngineError("the selected device does not expose a stereo output; audio was left untouched")
-        }
+        guard channels >= 2 else { throw EngineError("the selected device does not expose a stereo output; audio was left untouched") }
     }
 
     private func nominalSampleRate(of id: AudioObjectID) throws -> Double {
@@ -252,11 +272,7 @@ final class SystemAudioEngine {
     }
 
     private func propertyAddress(_ selector: AudioObjectPropertySelector) -> AudioObjectPropertyAddress {
-        AudioObjectPropertyAddress(
-            mSelector: selector,
-            mScope: kAudioObjectPropertyScopeGlobal,
-            mElement: kAudioObjectPropertyElementMain
-        )
+        AudioObjectPropertyAddress(mSelector: selector, mScope: kAudioObjectPropertyScopeGlobal, mElement: kAudioObjectPropertyElementMain)
     }
 
     private func check(_ status: OSStatus, _ operation: String) throws {
@@ -264,10 +280,7 @@ final class SystemAudioEngine {
     }
 
     private static func message(for error: Error) -> String {
-        if let described = error as? LocalizedError, let message = described.errorDescription {
-            return message
-        }
-        return error.localizedDescription
+        (error as? LocalizedError)?.errorDescription ?? error.localizedDescription
     }
 
     private struct CoreAudioFailure: LocalizedError {
