@@ -1,6 +1,6 @@
 # patchbay
 
-A native, open-source DSP rack for macOS system audio. No virtual audio driver.
+A native, open-source DSP rack and per-app router for macOS system audio. No virtual audio driver.
 
 <p align="center">
   <img src="screenshot.png" width="426" alt="patchbay devices page">
@@ -26,11 +26,15 @@ A native, open-source DSP rack for macOS system audio. No virtual audio driver.
 - **Bypass** for instant A/B, input/output metering, **device sample rate** picker in the rack footer
 - **Output and input device switching**, hardware volume, mic gain and hardware mic mute
 - **eqMac recovery** tools (fix stuck audio, restart, reset Core Audio) on the Fix page
+- **App routing**: send one app to a different output device, with its own
+  chain. Everything not routed keeps using the system chain. Helper processes
+  (browser renderers, Electron utilities) follow their app; command-line
+  players (`afplay`, `mpv`, `ffplay`) are routed by executable name.
 
 ## Interface
 
-One menu bar popover with four icon tabs: output, input, rack, fix. It opens
-and closes without animation; in-app motion is short springs.
+One menu bar popover with five icon tabs: output, input, routes, rack, fix. It
+opens and closes without animation; in-app motion is short springs.
 
 - **Layout** follows the page by default (*Auto*): one width, device pages
   compact and only as tall as their content, the rack spacious and capped at
@@ -53,6 +57,12 @@ and closes without animation; in-app motion is short springs.
   when it differs, and a live spectrum of the processed output behind them.
   Dynamics, saturation and space modules have no fixed response and are not
   drawn. The analyser only runs while the panel is visible.
+- **Routes** lists each app → device pair with a live status dot (waiting for
+  the app, processing, error). The `+` menu offers every app currently
+  connected to Core Audio. The sliders button on a row opens that route's chain
+  in the rack; a scope chip at the start of the chain strip switches between
+  the system chain and each route. The header switch and footer status refer
+  to the route being edited only while the rack page is in front.
 
 ## How it works
 
@@ -60,12 +70,17 @@ patchbay uses the Core Audio process-tap API (macOS 14.2+) instead of installing
 a virtual audio driver:
 
 ```text
-system audio → process tap → [ module → module → … ] → output device
+system audio (minus routed apps) → system tap → [ chain ] → default device
+app A                             → route tap  → [ chain ] → device X
 ```
 
-The tap and the current output device are combined into a private aggregate
-device. An IO proc on that aggregate reads the tapped mix, runs the chain, and
-writes the result to the hardware. Nothing is installed into the system.
+Each tap and its output device are combined into a private aggregate device.
+An IO proc on that aggregate reads the tapped mix, runs the chain, and writes
+the result to the hardware. A route's tap is a stereo mixdown of exactly that
+app's processes; the system tap excludes them so nothing is captured twice.
+When an app's process set changes, the live tap's description is updated in
+place (`kAudioTapPropertyDescription`); the pipeline is only rebuilt if the
+HAL refuses. Nothing is installed into the system.
 
 Safety properties of this design:
 
@@ -77,6 +92,9 @@ Safety properties of this design:
 - **Realtime path is allocation-free and lock-free.** The UI publishes immutable
   config snapshots through an atomic pointer (`DSPConfig.c`); filter memory is
   kept across parameter changes so slider moves never click. Output is NaN-guarded.
+- **Routes prove capture once.** A route whose app goes quiet keeps its proof,
+  so the app's next sound is captured muted immediately instead of leaking a
+  proof window to the default device.
 
 Tap topology is chosen in Settings → Audio capture. *Stereo mixdown* (default)
 has Core Audio mix every process to one stereo stream in its own format, which

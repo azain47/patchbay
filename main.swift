@@ -279,6 +279,15 @@ final class AudioState: ObservableObject {
     @Published var rackOn = false
     @Published var rackStatus: SystemAudioEngine.Status = .stopped
     @Published var selectedModule: UUID?
+
+    // Routing: which app goes where. `rack` always holds the chain being edited; `rackScope`
+    // says whether that is the system chain or one route's chain.
+    enum RackScope: Equatable { case system, route(UUID) }
+    @Published var rackScope: RackScope = .system
+    @Published var routes: [Route] = []
+    @Published var routeStatus: [UUID: SystemAudioEngine.Status] = [:]
+    @Published var audioApps: [AudioApp] = []
+    @Published var tab: Tab = .output
     @Published var inputVolume: Float = 1
     @Published var outputVolume: Float?
     @Published var outputRates: [Double] = []
@@ -300,7 +309,9 @@ final class AudioState: ObservableObject {
     private var listeners: [(AudioObjectPropertySelector, AudioObjectPropertyListenerBlock)] = []
     private var wakeObserver: NSObjectProtocol?
     private let rackStore = RackSettingsStore()
+    private let routesStore = RoutesStore()
     private let engine = SystemAudioEngine()
+    private var routeEngines: [UUID: SystemAudioEngine] = [:]
     private var rackDeviceUID: String?
     var onHealth: ((Bool) -> Void)?
 
@@ -312,9 +323,11 @@ final class AudioState: ObservableObject {
         }
         engine.onNeedsRestart = { [weak self] in
             guard let self, self.rackOn, let target = self.rackTarget else { return }
-            self.engine.start(output: target, settings: self.rack)
+            self.engine.start(output: target, settings: self.systemRack)
         }
+        routes = routesStore.routes
         refresh()
+        refreshProcesses()
         selectedModule = rack.modules.first?.id
         for sel in [kAudioHardwarePropertyDefaultOutputDevice, kAudioHardwarePropertyDefaultInputDevice, kAudioHardwarePropertyDevices] {
             var a = CA.addr(sel)
@@ -322,18 +335,46 @@ final class AudioState: ObservableObject {
             AudioObjectAddPropertyListenerBlock(AudioObjectID(kAudioObjectSystemObject), &a, nil, block)
             listeners.append((sel, block))
         }
+        var processAddress = CA.addr(kAudioHardwarePropertyProcessObjectList)
+        let processBlock: AudioObjectPropertyListenerBlock = { [weak self] _, _ in DispatchQueue.main.async { self?.refreshProcesses() } }
+        AudioObjectAddPropertyListenerBlock(AudioObjectID(kAudioObjectSystemObject), &processAddress, nil, processBlock)
+        listeners.append((kAudioHardwarePropertyProcessObjectList, processBlock))
         timer = Timer.scheduledTimer(withTimeInterval: 10, repeats: true) { [weak self] _ in DispatchQueue.main.async { self?.updateHealth() } }
         wakeObserver = NSWorkspace.shared.notificationCenter.addObserver(forName: NSWorkspace.didWakeNotification, object: nil, queue: .main) { [weak self] _ in
-            guard let self, self.rackOn, let target = self.rackTarget else { return }
-            self.engine.start(output: target, settings: self.rack)
+            guard let self else { return }
+            if self.rackOn, let target = self.rackTarget { self.engine.start(output: target, settings: self.systemRack) }
+            for engine in self.routeEngines.values { engine.stop() }
+            self.refreshProcesses()
         }
     }
     @Published var tapMode: SystemAudioEngine.TapMode = SystemAudioEngine.TapMode(rawValue: UserDefaults.standard.string(forKey: "tapMode") ?? "") ?? .mixdown {
         didSet {
             UserDefaults.standard.set(tapMode.rawValue, forKey: "tapMode")
             engine.tapMode = tapMode
-            if rackOn, let target = rackTarget { engine.start(output: target, settings: rack) }
+            if rackOn, let target = rackTarget { engine.start(output: target, settings: systemRack) }
         }
+    }
+
+    /// The engine whose chain is currently being edited: the system engine or a route's.
+    private var scopedEngine: SystemAudioEngine? {
+        switch rackScope {
+        case .system: engine
+        case .route(let id): routeEngines[id]
+        }
+    }
+    private var scopedOn: Bool {
+        switch rackScope {
+        case .system: rackOn
+        case .route(let id): routes.first { $0.id == id }?.enabled ?? false
+        }
+    }
+    /// The system chain regardless of what the rack page is editing. `rack` is only the
+    /// system chain while `rackScope == .system`; otherwise read it back from the store.
+    private var systemRack: RackSettings {
+        if rackScope == .system { return rack }
+        var stored = rackDeviceUID.map { rackStore.settings(for: $0) } ?? .neutral
+        stored.enabled = rackOn
+        return stored
     }
 
     /// Meters only tick while the popover is visible.
@@ -342,15 +383,17 @@ final class AudioState: ObservableObject {
         guard visible else { return }
         meterTimer = Timer.scheduledTimer(withTimeInterval: 1.0 / 30, repeats: true) { [weak self] _ in
             guard let self else { return }
-            let i = self.rackOn ? self.engine.inputPeak : 0, o = self.rackOn ? self.engine.outputPeak : 0
+            let live = self.scopedOn ? self.scopedEngine : nil
+            let i = live?.inputPeak ?? 0, o = live?.outputPeak ?? 0
             if abs(i - self.meters.input) > 0.002 { self.meters.input = i }
             if abs(o - self.meters.output) > 0.002 { self.meters.output = o }
-            self.meters.analyse(sampleRate: self.rackTarget?.rate ?? 48_000) { self.rackOn && self.engine.scopeSnapshot(into: $0) }
+            self.meters.analyse(sampleRate: live?.sampleRate ?? 48_000) { live?.scopeSnapshot(into: $0) ?? false }
         }
     }
 
     deinit {
         timer?.invalidate(); meterTimer?.invalidate(); engine.stop()
+        for engine in routeEngines.values { engine.stop() }
         if let wakeObserver { NSWorkspace.shared.notificationCenter.removeObserver(wakeObserver) }
         for (sel, block) in listeners {
             var a = CA.addr(sel)
@@ -369,6 +412,7 @@ final class AudioState: ObservableObject {
         if let input = currentInput { micMuted = CA.mute(input.id, input: true) ?? (inputVolume == 0 && micVolumeBeforeMute > 0) }
         updateHealth()
         synchronizeRackDevice()
+        synchronizeRoutes()
     }
 
     /// pgrep on a background queue; the main thread never blocks on a process spawn.
@@ -401,13 +445,156 @@ final class AudioState: ObservableObject {
         }
         if rackDeviceUID != target.uid {
             rackDeviceUID = target.uid
-            var loaded = rackStore.settings(for: target.uid)
-            loaded.enabled = rackOn
-            rack = loaded
-            if selected == nil { selectedModule = rack.modules.first?.id }
+            if rackScope == .system {
+                var loaded = rackStore.settings(for: target.uid)
+                loaded.enabled = rackOn
+                rack = loaded
+                if selected == nil { selectedModule = rack.modules.first?.id }
+            }
         }
         guard rackOn, active != .rack, engine.outputUID != target.uid else { return }
-        engine.start(output: target, settings: rack)
+        engine.start(output: target, settings: systemRack)
+    }
+
+    // MARK: Routing
+
+    /// Re-reads Core Audio's process list, regroups it by app, and pushes the new process
+    /// sets to every engine. Cheap; runs on each process-list change.
+    func refreshProcesses() {
+        audioApps = AudioProcesses.apps()
+        synchronizeRoutes()
+    }
+
+    private func objects(for route: Route) -> [AudioObjectID] {
+        audioApps.first { $0.bundleID == route.bundleID }?.objects ?? []
+    }
+
+    /// Starts, retargets or stops one engine per enabled route, and keeps the routed
+    /// processes out of the system tap.
+    private func synchronizeRoutes() {
+        var routedObjects: [AudioObjectID] = []
+        for route in routes {
+            let objects = objects(for: route)
+            let device = outputs.first { $0.uid == route.outputUID }
+            guard route.enabled, let device, !objects.isEmpty else {
+                if !route.enabled {
+                    routeEngines.removeValue(forKey: route.id)?.stop()
+                    routeStatus[route.id] = .stopped
+                } else {
+                    routeEngines[route.id]?.idle()
+                    routeStatus[route.id] = device == nil ? .failed("Output device is not connected.") : .waiting(app: route.name)
+                }
+                continue
+            }
+            routedObjects += objects
+            let engine = routeEngines[route.id] ?? makeRouteEngine(route.id)
+            let scope = SystemAudioEngine.Scope.processes(objects)
+            if engine.outputUID != device.uid {
+                engine.scope = scope
+                engine.start(output: device, settings: route.rack)
+            } else {
+                engine.setScope(scope)
+            }
+        }
+        for id in routeEngines.keys where !routes.contains(where: { $0.id == id }) {
+            routeEngines.removeValue(forKey: id)?.stop()
+            routeStatus[id] = nil
+        }
+        engine.setScope(.system(excluding: routedObjects))
+    }
+
+    private func makeRouteEngine(_ id: UUID) -> SystemAudioEngine {
+        let engine = SystemAudioEngine()
+        engine.onStatus = { [weak self] status in
+            guard let self else { return }
+            // An idled engine says "stopped"; while the route is enabled that means "waiting for the app".
+            if status == .stopped, let route = self.routes.first(where: { $0.id == id }), route.enabled {
+                self.routeStatus[id] = .waiting(app: route.name)
+            } else {
+                self.routeStatus[id] = status
+            }
+        }
+        engine.onNeedsRestart = { [weak self] in
+            guard let self, let route = self.routes.first(where: { $0.id == id }), let device = self.outputs.first(where: { $0.uid == route.outputUID }) else { return }
+            engine.scope = .processes(self.objects(for: route))
+            engine.start(output: device, settings: route.rack)
+        }
+        routeEngines[id] = engine
+        return engine
+    }
+
+    func addRoute(app: AudioApp, outputUID: String) {
+        guard !routes.contains(where: { $0.bundleID == app.bundleID }) else { return }
+        routes.append(Route(bundleID: app.bundleID, name: app.name, outputUID: outputUID))
+        saveRoutes()
+    }
+
+    func removeRoute(_ id: UUID) {
+        if rackScope == .route(id) { setRackScope(.system) }
+        routes.removeAll { $0.id == id }
+        saveRoutes()
+    }
+
+    func setRoute(_ id: UUID, enabled: Bool) {
+        guard let i = routes.firstIndex(where: { $0.id == id }) else { return }
+        routes[i].enabled = enabled
+        if rackScope == .route(id) { rack.enabled = enabled }
+        saveRoutes()
+    }
+
+    func setRoute(_ id: UUID, outputUID: String) {
+        guard let i = routes.firstIndex(where: { $0.id == id }), routes[i].outputUID != outputUID else { return }
+        routes[i].outputUID = outputUID
+        routeEngines[id]?.stop()   // forces a restart on the new device in synchronizeRoutes
+        saveRoutes()
+    }
+
+    private func saveRoutes() {
+        routesStore.save(routes)
+        synchronizeRoutes()
+    }
+
+    /// Switches which chain the rack page edits. The edited copy is written back to its
+    /// owner first so nothing is lost.
+    func setRackScope(_ scope: RackScope) {
+        guard scope != rackScope else { return }
+        persistRack()
+        rackScope = scope
+        switch scope {
+        case .system:
+            var loaded = rackDeviceUID.map { rackStore.settings(for: $0) } ?? .neutral
+            loaded.enabled = rackOn
+            rack = loaded
+        case .route(let id):
+            guard let route = routes.first(where: { $0.id == id }) else { rackScope = .system; return }
+            var loaded = route.rack
+            loaded.enabled = route.enabled
+            rack = loaded
+        }
+        selectedModule = rack.modules.first?.id
+    }
+
+    /// What the header switch, status dot and footer refer to: the route being edited
+    /// while the rack page is in front, the system chain everywhere else. Flipping the
+    /// switch from the device pages must never silently toggle a route.
+    var headerScope: RackScope { tab == .rack ? rackScope : .system }
+    var scopeOn: Bool {
+        switch headerScope {
+        case .system: rackOn
+        case .route(let id): routes.first { $0.id == id }?.enabled ?? false
+        }
+    }
+    var scopeStatus: SystemAudioEngine.Status {
+        switch headerScope {
+        case .system: rackStatus
+        case .route(let id): routeStatus[id] ?? .stopped
+        }
+    }
+    func setScopeOn(_ on: Bool) {
+        switch headerScope {
+        case .system: setRackOn(on)
+        case .route(let id): setRoute(id, enabled: on)
+        }
     }
 
     func select(_ device: Device) {
@@ -421,7 +608,7 @@ final class AudioState: ObservableObject {
         CA.setDefault(device.id, input: false)
         DispatchQueue.main.asyncAfter(deadline: .now() + 0.3) {
             self.refresh()
-            if self.rackOn, let target = self.rackTarget { self.engine.start(output: target, settings: self.rack) }
+            if self.rackOn, let target = self.rackTarget { self.engine.start(output: target, settings: self.systemRack) }
         }
     }
 
@@ -449,7 +636,7 @@ final class AudioState: ObservableObject {
             CA.setDefault(target.id, input: false)
             DispatchQueue.main.async {
                 self.refresh()
-                self.engine.start(output: target, settings: self.rack)
+                self.engine.start(output: target, settings: self.systemRack)
                 self.active = nil
             }
         }
@@ -522,12 +709,12 @@ final class AudioState: ObservableObject {
     }
 
     func resetRack() {
-        var neutral = RackSettings.neutral
-        neutral.enabled = rackOn
+        var neutral = rackScope == .system ? RackSettings.neutral : RackSettings(modules: [])
+        neutral.enabled = scopedOn
         rack = neutral
         selectedModule = rack.modules.first?.id
         persistRack()
-        engine.publish(rack)
+        scopedEngine?.publish(rack)
     }
 
     // MARK: Presets, import, export
@@ -588,12 +775,19 @@ final class AudioState: ObservableObject {
     private func update(_ mutate: (inout RackSettings) -> Void) {
         mutate(&rack)
         persistRack()
-        engine.publish(rack)
+        scopedEngine?.publish(rack)
     }
 
     private func persistRack() {
-        guard let uid = rackDeviceUID else { return }
-        rackStore.save(rack, for: uid)
+        switch rackScope {
+        case .system:
+            guard let uid = rackDeviceUID else { return }
+            rackStore.save(rack, for: uid)
+        case .route(let id):
+            guard let i = routes.firstIndex(where: { $0.id == id }) else { return }
+            routes[i].rack = rack
+            routesStore.save(routes)
+        }
     }
 
     // MARK: eqMac recovery

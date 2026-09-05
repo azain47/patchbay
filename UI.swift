@@ -152,13 +152,14 @@ struct Wordmark: View {
 // MARK: - Root
 
 enum Tab: String, CaseIterable, Identifiable {
-    case output, input, rack, fix
+    case output, input, routes, rack, fix
     var id: String { rawValue }
     var title: String { rawValue.capitalized }
     var symbol: String {
         switch self {
         case .output: "speaker.wave.2"
         case .input: "mic"
+        case .routes: "arrow.triangle.branch"
         case .rack: "slider.horizontal.3"
         case .fix: "bandage"
         }
@@ -168,21 +169,22 @@ enum Tab: String, CaseIterable, Identifiable {
 struct Root: View {
     @ObservedObject var audio: AudioState
     @ObservedObject var theme: Theme
-    @State private var tab: Tab = .output
 
     var body: some View {
+        let tab = audio.tab
         let front = theme.density.metrics(for: tab)
         VStack(spacing: 0) {
             HStack(spacing: 14) {
                 Wordmark()
                 Spacer()
-                TabBar(tab: $tab)
+                TabBar(tab: $audio.tab)
                 Spacer()
                 HStack(spacing: 8) {
                     Circle().fill(statusColor).frame(width: 6, height: 6)
-                    Toggle("", isOn: Binding(get: { audio.rackOn }, set: { audio.setRackOn($0) }))
+                    Toggle("", isOn: Binding(get: { audio.scopeOn }, set: { audio.setScopeOn($0) }))
                         .labelsHidden().toggleStyle(.switch).controlSize(.small).tint(T.accent)
                         .disabled(audio.active != nil)
+                        .help(audio.headerScope == .system ? "System chain" : "This route")
                 }
             }
             .padding(.horizontal, T.chromePadding).padding(.vertical, 12)
@@ -229,16 +231,17 @@ struct Root: View {
         switch t {
         case .output: OutputTab(audio: audio)
         case .input: InputTab(audio: audio)
+        case .routes: RoutesTab(audio: audio)
         case .rack: RackTab(audio: audio, active: active)
         case .fix: FixTab(audio: audio)
         }
     }
 
     private var statusColor: Color {
-        guard audio.rackOn else { return Color.secondary.opacity(0.35) }
-        switch audio.rackStatus {
+        guard audio.scopeOn else { return Color.secondary.opacity(0.35) }
+        switch audio.scopeStatus {
         case .running: return audio.rack.bypass ? T.accent : T.ok
-        case .proving: return T.accent
+        case .proving, .waiting: return T.accent
         case .failed: return T.warn
         case .stopped: return Color.secondary.opacity(0.35)
         }
@@ -280,7 +283,7 @@ struct Footer: View {
 
     var body: some View {
         HStack(spacing: 10) {
-            Text(audio.rackOn ? audio.rackStatus.label : "rack off").font(m.mono).foregroundStyle(.tertiary)
+            Text(audio.scopeOn ? audio.scopeStatus.label : (audio.headerScope == .system ? "rack off" : "route off")).font(m.mono).foregroundStyle(.tertiary)
             Spacer()
             Button { showSettings.toggle() } label: {
                 Image(systemName: "gearshape").font(.system(size: 11)).foregroundStyle(.secondary).frame(width: 24, height: 22)
@@ -476,6 +479,131 @@ struct InputTab: View {
             Color.clear.frame(height: m.sectionTop)
         }
         .frame(maxWidth: .infinity, alignment: .top)
+    }
+}
+
+// MARK: - Routes tab
+
+struct RoutesTab: View {
+    @Environment(\.metrics) private var m
+    @ObservedObject var audio: AudioState
+
+    private var unrouted: [AudioApp] { audio.audioApps.filter { app in !audio.routes.contains { $0.bundleID == app.bundleID } } }
+
+    var body: some View {
+        VStack(spacing: 0) {
+            HStack {
+                SectionLabel(text: "App routes")
+                Menu {
+                    if unrouted.isEmpty {
+                        Text("No other apps are connected to Core Audio")
+                    }
+                    ForEach(unrouted) { app in
+                        Button {
+                            audio.addRoute(app: app, outputUID: audio.rackTarget?.uid ?? audio.outputs.first?.uid ?? "")
+                        } label: {
+                            Label { Text(app.name) } icon: {
+                                if let icon = AudioApp.icon(for: app.bundleID) { Image(nsImage: icon) }
+                            }
+                        }
+                    }
+                } label: {
+                    Image(systemName: "plus").font(.system(size: 11, weight: .semibold)).foregroundStyle(.secondary).frame(width: 22, height: 20)
+                }
+                .menuStyle(.borderlessButton).menuIndicator(.hidden).frame(width: 26)
+                .help("Route an app to a device")
+            }
+            .padding(.leading, m.gutter).padding(.trailing, 8).padding(.top, m.sectionTop).padding(.bottom, m.sectionTop / 2)
+
+            if audio.routes.isEmpty {
+                VStack(spacing: 6) {
+                    Image(systemName: "arrow.triangle.branch").font(.system(size: 20)).foregroundStyle(.quaternary)
+                    Text("Send one app to a different output.").font(m.mono).foregroundStyle(.tertiary)
+                    Text("Everything you do not route keeps using the system chain.").font(m.monoSmall).foregroundStyle(.quaternary)
+                }
+                .frame(maxWidth: .infinity).padding(.vertical, m.sectionTop * 2)
+            } else {
+                VStack(spacing: m.rowGap) {
+                    ForEach(audio.routes) { route in RouteRow(route: route, audio: audio) }
+                }
+                .padding(.horizontal, 10)
+                .animation(T.quick, value: audio.routes.map(\.id))
+            }
+            Color.clear.frame(height: m.sectionTop)
+        }
+        .frame(maxWidth: .infinity, alignment: .top)
+        .onAppear { audio.refreshProcesses() }
+    }
+}
+
+struct RouteRow: View {
+    @Environment(\.metrics) private var m
+    let route: Route
+    @ObservedObject var audio: AudioState
+    @State private var hover = false
+
+    private var status: SystemAudioEngine.Status { audio.routeStatus[route.id] ?? .stopped }
+    private var device: Device? { audio.outputs.first { $0.uid == route.outputUID } }
+    private var editing: Bool { audio.rackScope == .route(route.id) }
+
+    var body: some View {
+        HStack(spacing: 10) {
+            Button { audio.setRoute(route.id, enabled: !route.enabled) } label: {
+                Circle().fill(dot).frame(width: 7, height: 7).frame(width: 14, height: 14).contentShape(Rectangle())
+            }
+            .buttonStyle(.plain).help(route.enabled ? status.label : "off")
+
+            if let icon = AudioApp.icon(for: route.bundleID) {
+                Image(nsImage: icon).resizable().frame(width: m.badge - 2, height: m.badge - 2)
+            } else {
+                Image(systemName: "app").frame(width: m.badge - 2, height: m.badge - 2).foregroundStyle(.secondary)
+            }
+            VStack(alignment: .leading, spacing: 2) {
+                Text(route.name).font(m.nameStrong).lineLimit(1).foregroundStyle(route.enabled ? .primary : .secondary)
+                if m.subtitle { Text(route.enabled ? status.label : "off").font(m.monoSmall).foregroundStyle(.tertiary) }
+            }
+            Spacer(minLength: 6)
+            Image(systemName: "arrow.right").font(.system(size: 9, weight: .semibold)).foregroundStyle(.quaternary)
+            Menu {
+                ForEach(audio.outputs.filter { !$0.isEqMac }) { d in
+                    Button { audio.setRoute(route.id, outputUID: d.uid) } label: {
+                        HStack { Text(d.name); if d.uid == route.outputUID { Image(systemName: "checkmark") } }
+                    }
+                }
+            } label: {
+                HStack(spacing: 5) {
+                    Image(systemName: device?.icon ?? "questionmark").font(.system(size: 10))
+                    Text(device?.name ?? "Not connected").font(m.name).lineLimit(1)
+                    Image(systemName: "chevron.up.chevron.down").font(.system(size: 8, weight: .semibold)).foregroundStyle(.tertiary)
+                }
+                .foregroundStyle(device == nil ? T.warn : .primary)
+                .padding(.horizontal, 8).padding(.vertical, 4)
+                .background(Capsule().fill(T.card))
+                .overlay(Capsule().strokeBorder(T.hairline, lineWidth: 0.5))
+            }
+            .menuStyle(.borderlessButton).menuIndicator(.hidden).fixedSize()
+
+            IconButton("slider.horizontal.3", active: editing) {
+                audio.setRackScope(.route(route.id))
+                audio.tab = .rack
+            }
+            .help("Edit this route's chain")
+            IconButton("xmark") { audio.removeRoute(route.id) }.help("Remove route").opacity(hover ? 1 : 0.3)
+        }
+        .padding(.horizontal, 10).padding(.vertical, m.rowV + 1)
+        .background(RoundedRectangle(cornerRadius: 8).fill(hover ? T.hover : .clear))
+        .onHover { hover = $0 }
+        .animation(T.hoverAnim, value: hover)
+    }
+
+    private var dot: Color {
+        guard route.enabled else { return Color.primary.opacity(0.18) }
+        switch status {
+        case .running: return T.ok
+        case .proving, .waiting: return T.accent
+        case .failed: return T.warn
+        case .stopped: return Color.primary.opacity(0.18)
+        }
     }
 }
 
@@ -767,9 +895,43 @@ struct ChainStrip: View {
     @Environment(\.metrics) private var m
     @ObservedObject var audio: AudioState
 
+    private var scopeName: String {
+        switch audio.rackScope {
+        case .system: "System"
+        case .route(let id): audio.routes.first { $0.id == id }?.name ?? "Route"
+        }
+    }
+
     var body: some View {
-        ScrollView(.horizontal, showsIndicators: false) {
-            HStack(spacing: 6) {
+        HStack(spacing: 6) {
+            if !audio.routes.isEmpty {
+                Menu {
+                    Button { audio.setRackScope(.system) } label: {
+                        HStack { Text("System"); if audio.rackScope == .system { Image(systemName: "checkmark") } }
+                    }
+                    Divider()
+                    ForEach(audio.routes) { route in
+                        Button { audio.setRackScope(.route(route.id)) } label: {
+                            HStack { Text(route.name); if audio.rackScope == .route(route.id) { Image(systemName: "checkmark") } }
+                        }
+                    }
+                } label: {
+                    HStack(spacing: 5) {
+                        Image(systemName: audio.rackScope == .system ? "macwindow.on.rectangle" : "arrow.triangle.branch").font(.system(size: 10))
+                        Text(scopeName).font(.system(size: 11.5, weight: .semibold)).lineLimit(1)
+                        Image(systemName: "chevron.up.chevron.down").font(.system(size: 8, weight: .semibold)).foregroundStyle(.tertiary)
+                    }
+                    .foregroundStyle(T.accent)
+                    .padding(.horizontal, 9).padding(.vertical, 5)
+                    .background(Capsule().fill(T.accent.opacity(0.12)))
+                }
+                .menuStyle(.borderlessButton).menuIndicator(.hidden).fixedSize()
+                .help("Which chain to edit")
+                .padding(.leading, m.gutter)
+                Rectangle().fill(T.hairline).frame(width: 0.5, height: 18)
+            }
+            ScrollView(.horizontal, showsIndicators: false) {
+                HStack(spacing: 6) {
                 ForEach(audio.rack.modules) { m in
                     ChainChip(module: m, selected: audio.selectedModule == m.id,
                               select: { audio.selectedModule = m.id },
@@ -798,10 +960,12 @@ struct ChainStrip: View {
                         .overlay(Circle().strokeBorder(T.hairline, lineWidth: 0.5))
                 }
                 .menuStyle(.borderlessButton).menuIndicator(.hidden).frame(width: 30)
+                }
+                .padding(.leading, audio.routes.isEmpty ? m.gutter : 4).padding(.trailing, m.gutter)
+                .animation(T.quick, value: audio.rack.modules.map(\.id))
             }
-            .padding(.horizontal, m.gutter).padding(.vertical, m.rowV + 4)
-            .animation(T.quick, value: audio.rack.modules.map(\.id))
         }
+        .padding(.vertical, m.rowV + 4)
     }
 }
 

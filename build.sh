@@ -33,6 +33,7 @@ swiftc \
     "$DIR/AudioEngine.swift" \
     "$DIR/UI.swift" \
     "$DIR/AutoEQ.swift" \
+    "$DIR/Routing.swift" \
     "$OBJ"
 
 cat > "$APP/Contents/Info.plist" << 'EOF'

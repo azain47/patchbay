@@ -11,6 +11,8 @@ final class SystemAudioEngine {
         case proving(device: String)
         case running(device: String)
         case failed(String)
+        /// A route whose app currently has no Core Audio client; nothing to tap yet.
+        case waiting(app: String)
 
         var label: String {
             switch self {
@@ -18,6 +20,7 @@ final class SystemAudioEngine {
             case .proving: "waiting for audio"
             case .running: "processing"
             case .failed: "error"
+            case .waiting(let app): "waiting for \(app)"
             }
         }
     }
@@ -26,6 +29,38 @@ final class SystemAudioEngine {
     /// Which tap topology to build. Mixdown is the conservative default; the device-stream tap
     /// avoids a resample but is exposed as an A/B switch because behaviour differs per device.
     var tapMode: TapMode = .mixdown
+
+    /// What the tap listens to. The system engine takes everything except processes that a
+    /// route already owns; a route engine takes exactly its app's processes.
+    enum Scope: Equatable {
+        case system(excluding: [AudioObjectID])
+        case processes([AudioObjectID])
+    }
+    var scope: Scope = .system(excluding: [])
+
+    /// Applies a new process set to the live tap without tearing the pipeline down. Falls
+    /// back to a rebuild when the HAL refuses the description change.
+    func setScope(_ newScope: Scope) {
+        guard newScope != scope else { return }
+        scope = newScope
+        guard tapID != kAudioObjectUnknown, let description = tapDescription else { return }
+        switch newScope {
+        case .system(let excluded): description.processes = excluded + ownProcess()
+        case .processes(let ids): description.processes = ids
+        }
+        var address = propertyAddress(kAudioTapPropertyDescription)
+        var object: Unmanaged<CATapDescription>? = Unmanaged.passUnretained(description)
+        let size = UInt32(MemoryLayout<Unmanaged<CATapDescription>?>.size)
+        let status = AudioObjectSetPropertyData(tapID, &address, 0, nil, size, &object)
+        engineLog.info("tap description update -> \(status)")
+        if status != noErr { onNeedsRestart?() }
+    }
+
+    private var tapDescription: CATapDescription?
+
+    private func ownProcess() -> [AudioObjectID] {
+        (try? processObjectID(for: getpid())).map { [$0] } ?? []
+    }
     struct Diagnostics: Equatable {
         var tapBinding = "—"
         var sampleRate = 0.0
@@ -93,6 +128,16 @@ final class SystemAudioEngine {
         status = .stopped
     }
 
+    /// Tears the pipeline down but remembers that capture was proven, so a route whose
+    /// app went quiet does not replay the unmuted proof window when it comes back.
+    func idle() {
+        guard status != .stopped || outputUID != nil else { return }
+        engineLog.info("idle")
+        stopResources()
+        outputUID = nil
+        status = .stopped
+    }
+
     func publish(_ settings: RackSettings) {
         self.settings = settings
         generation &+= 1
@@ -131,35 +176,55 @@ final class SystemAudioEngine {
     // MARK: Pipeline
 
     private func buildPipeline(output: Device, proofOnly: Bool) throws {
-        var excluded: [AudioObjectID] = []
-        if let processID = try? processObjectID(for: getpid()) { excluded.append(processID) }
-
-        // Prefer a tap bound to the device's own stream: its format matches the hardware
-        // stream exactly, so Core Audio does no rate conversion between tap and output.
-        // Fall back to the global stereo mixdown when the device stream isn't plain stereo.
-        var description = CATapDescription(__excludingProcesses: excluded.map { NSNumber(value: $0) }, andDeviceUID: output.uid, withStream: 0)
-        var binding = "device stream"
-        description.name = "patchbay system tap"
-        description.isPrivate = true
-        description.muteBehavior = proofOnly ? CATapMuteBehavior.unmuted : CATapMuteBehavior.mutedWhenTapped
-
+        let mute = proofOnly ? CATapMuteBehavior.unmuted : CATapMuteBehavior.mutedWhenTapped
         var newTapID = AudioObjectID(kAudioObjectUnknown)
-        var created = tapMode == .deviceStream && AudioHardwareCreateProcessTap(description, &newTapID) == noErr && tapIsStereoFloat(newTapID)
-        if !created {
-            if newTapID != kAudioObjectUnknown { AudioHardwareDestroyProcessTap(newTapID); newTapID = kAudioObjectUnknown }
-            description = CATapDescription(stereoGlobalTapButExcludeProcesses: excluded)
+        var description: CATapDescription
+        var binding: String
+
+        switch scope {
+        case .processes(let ids):
+            // A route: exactly this app's processes, mixed to stereo. The tap mutes them at
+            // the device they were playing to once capture is proven, and this engine
+            // re-emits them on the route's output.
+            description = CATapDescription(stereoMixdownOfProcesses: ids)
+            description.name = "patchbay route tap"
+            description.isPrivate = true
+            description.muteBehavior = mute
+            binding = "app mixdown"
+            try check(AudioHardwareCreateProcessTap(description, &newTapID), "creating the route tap")
+            guard tapIsStereoFloat(newTapID) else {
+                AudioHardwareDestroyProcessTap(newTapID)
+                throw EngineError("the route tap did not provide stereo Float32 audio")
+            }
+
+        case .system(let routed):
+            let excluded = routed + ownProcess()
+            // Prefer a tap bound to the device's own stream: its format matches the hardware
+            // stream exactly, so Core Audio does no rate conversion between tap and output.
+            // Fall back to the global stereo mixdown when the device stream isn't plain stereo.
+            description = CATapDescription(__excludingProcesses: excluded.map { NSNumber(value: $0) }, andDeviceUID: output.uid, withStream: 0)
+            binding = "device stream"
             description.name = "patchbay system tap"
             description.isPrivate = true
-            description.muteBehavior = proofOnly ? CATapMuteBehavior.unmuted : CATapMuteBehavior.mutedWhenTapped
-            binding = "stereo mixdown"
-            try check(AudioHardwareCreateProcessTap(description, &newTapID), "creating the system tap")
-            created = tapIsStereoFloat(newTapID)
-            guard created else {
-                AudioHardwareDestroyProcessTap(newTapID)
-                throw EngineError("the system tap did not provide stereo Float32 audio; audio was left untouched")
+            description.muteBehavior = mute
+            var created = tapMode == .deviceStream && AudioHardwareCreateProcessTap(description, &newTapID) == noErr && tapIsStereoFloat(newTapID)
+            if !created {
+                if newTapID != kAudioObjectUnknown { AudioHardwareDestroyProcessTap(newTapID); newTapID = kAudioObjectUnknown }
+                description = CATapDescription(stereoGlobalTapButExcludeProcesses: excluded)
+                description.name = "patchbay system tap"
+                description.isPrivate = true
+                description.muteBehavior = mute
+                binding = "stereo mixdown"
+                try check(AudioHardwareCreateProcessTap(description, &newTapID), "creating the system tap")
+                created = tapIsStereoFloat(newTapID)
+                guard created else {
+                    AudioHardwareDestroyProcessTap(newTapID)
+                    throw EngineError("the system tap did not provide stereo Float32 audio; audio was left untouched")
+                }
             }
         }
         tapID = newTapID
+        tapDescription = description
 
         // Bluetooth: tap and output share the BT clock; drift compensation there makes the
         // HAL insert/drop samples periodically (audible crackle). Wired/USB clocks differ.
@@ -242,6 +307,7 @@ final class SystemAudioEngine {
             AudioHardwareDestroyProcessTap(tapID)
             tapID = AudioObjectID(kAudioObjectUnknown)
         }
+        tapDescription = nil
         processor = nil
     }
 
