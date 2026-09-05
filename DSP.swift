@@ -463,6 +463,69 @@ enum BiquadDesign {
     static func butterworthQ(sections: Int) -> [Double] {
         (0..<sections).map { k in 1 / (2 * cos(Double(2 * k + 1) * Double.pi / Double(4 * sections))) }
     }
+
+    /// Magnitude of a biquad cascade in dB at `frequency`. Summed per section: near DC
+    /// both polynomials of a low-frequency section are ~1e-8, so a running product
+    /// would underflow before the ratio is taken.
+    static func responseDB(_ cascade: [PBBiquad], frequency: Double, sampleRate: Double) -> Double {
+        let w = 2 * Double.pi * frequency / sampleRate
+        let c1 = cos(w), s1 = sin(w), c2 = cos(2 * w), s2 = sin(2 * w)
+        var db = 0.0
+        for c in cascade {
+            let nr = c.b0 + c.b1 * c1 + c.b2 * c2, ni = -(c.b1 * s1 + c.b2 * s2)
+            let dr = 1 + c.a1 * c1 + c.a2 * c2, di = -(c.a1 * s1 + c.a2 * s2)
+            db += 10 * log10(max(1e-20, nr * nr + ni * ni) / max(1e-20, dr * dr + di * di))
+        }
+        return max(-120, db)
+    }
+}
+
+// MARK: - Frequency response of the linear stages
+
+extension RackModule {
+    /// Biquad cascade this module contributes, for the response curve. Nil for
+    /// modules whose transfer depends on the signal (dynamics, saturation, space).
+    var linearCascade: [PBBiquad]? {
+        let sr = 48_000.0
+        switch kind {
+        case .parametricEQ, .graphicEQ:
+            return bands.filter(\.enabled).map { BiquadDesign.coefficients(type: $0.type, frequency: $0.frequency, gainDB: $0.gainDB, q: $0.q, sampleRate: sr) }
+        case .filter:
+            let type: FilterType = [FilterType.lowPass, .highPass, .bandPass][min(2, max(0, Int(param("type"))))]
+            let sections = min(4, max(1, Int(param("slope"))))
+            let qs = type == .bandPass ? Array(repeating: 1.0, count: sections) : BiquadDesign.butterworthQ(sections: sections)
+            return qs.map { BiquadDesign.coefficients(type: type, frequency: param("cutoff"), gainDB: 0, q: $0, sampleRate: sr) }
+        case .loudness:
+            let amount = param("amount")
+            return [BiquadDesign.coefficients(type: .lowShelf, frequency: 100, gainDB: amount, q: 0.707, sampleRate: sr),
+                    BiquadDesign.coefficients(type: .highShelf, frequency: 8_000, gainDB: amount * 0.4, q: 0.707, sampleRate: sr)]
+        case .gain:
+            return []
+        default:
+            return nil
+        }
+    }
+
+    /// Flat gain applied before the cascade, in dB.
+    var linearGainDB: Double {
+        switch kind {
+        case .parametricEQ, .graphicEQ: param("preamp")
+        case .gain: param("gain")
+        default: 0
+        }
+    }
+
+    func responseDB(at frequency: Double) -> Double {
+        guard let cascade = linearCascade else { return 0 }
+        return linearGainDB + BiquadDesign.responseDB(cascade, frequency: frequency, sampleRate: 48_000)
+    }
+}
+
+extension RackSettings {
+    /// Combined response of every enabled linear module. Nonlinear modules are skipped.
+    func responseDB(at frequency: Double) -> Double {
+        bypass ? 0 : modules.filter(\.enabled).reduce(0) { $0 + $1.responseDB(at: frequency) }
+    }
 }
 
 // MARK: - Compile settings into a realtime snapshot
@@ -611,6 +674,13 @@ final class RealtimeDSP {
     private(set) var inputPeak: Float = 0
     private(set) var outputPeak: Float = 0
 
+    /// Mono ring of the most recent output frames for the spectrum view. Written on the
+    /// HAL thread; the reader tolerates tearing (a partially updated window only smears
+    /// one frame of the display).
+    static let scopeFrames = 2048
+    private let scope: UnsafeMutablePointer<Float>
+    private(set) var scopeWrite = 0
+
     init?(settings: RackSettings, sampleRate: Double, generation: UInt64, layoutGeneration: UInt64, proofOnly: Bool) {
         guard let created = PBDSPConfigStoreCreate() else { return nil }
         store = created
@@ -642,6 +712,8 @@ final class RealtimeDSP {
         reverbFits = cursor < lineCapacity / 2
         scratchL = .allocate(capacity: Self.scratchFrames)
         scratchR = .allocate(capacity: Self.scratchFrames)
+        scope = .allocate(capacity: Self.scopeFrames)
+        scope.initialize(repeating: 0, count: Self.scopeFrames)
         publish(settings, generation: generation, layoutGeneration: layoutGeneration)
     }
 
@@ -653,6 +725,7 @@ final class RealtimeDSP {
         reverbGeometry.deallocate()
         scratchL.deallocate()
         scratchR.deallocate()
+        scope.deallocate()
         PBDSPConfigStoreDestroy(store)
     }
 
@@ -731,11 +804,27 @@ final class RealtimeDSP {
             outputPeak += 0.25 * (peakOut - outputPeak)
         }
 
+        var w = scopeWrite
+        let mask = Self.scopeFrames - 1
+        for i in 0..<frameCount {
+            scope[w] = (outSamples[i * 2] + outSamples[i * 2 + 1]) * 0.5
+            w = (w + 1) & mask
+        }
+        scopeWrite = w
+
         let written = frameCount * 2 * MemoryLayout<Float>.size
         if written < outBytes { memset(outputData.advanced(by: written), 0, outBytes - written) }
         for i in outputs.indices where i != destinationIndex {
             if let d = outputs[i].mData { memset(d, 0, Int(outputs[i].mDataByteSize)) }
         }
+    }
+
+    /// Copies the last `scopeFrames` output samples, oldest first, into `into`.
+    func scopeSnapshot(into: UnsafeMutablePointer<Float>) {
+        let w = scopeWrite
+        let tail = Self.scopeFrames - w
+        memcpy(into, scope + w, tail * MemoryLayout<Float>.size)
+        if w > 0 { memcpy(into + tail, scope, w * MemoryLayout<Float>.size) }
     }
 
     // MARK: Chain

@@ -32,16 +32,27 @@ A native, open-source DSP rack for macOS system audio. No virtual audio driver.
 One menu bar popover with four icon tabs: output, input, rack, fix. It opens
 and closes without animation; in-app motion is short springs.
 
-- **Layout** follows the page by default (*Auto*): the device pages are compact
-  and only as tall as their content; the rack is wide and spacious, capped at
-  640 pt with the module editor scrolling inside. *Compact*, *Comfortable* and
-  *Spacious* pin one density everywhere.
+- **Layout** follows the page by default (*Auto*): one width, device pages
+  compact and only as tall as their content, the rack spacious and capped at
+  640 pt with the module editor scrolling inside. Pages crossfade; nothing is
+  rebuilt on a tab switch. *Compact*, *Comfortable* and *Spacious* pin one
+  density everywhere.
 - **Settings** live behind the gear in the footer: appearance (system, dark,
   light — applied to the popover itself), layout, accent colour, and audio
   capture topology.
 - The chain is a strip of chips above the module editor in signal order,
   first stage on the left. Click to edit, drag to reorder, dot to bypass one
   module.
+- **Parametric EQ** is a row of vertical gain faders, one per filter, low to
+  high frequency. Tap a column to edit its type, frequency and Q in the row
+  below; the currently selected column is highlighted. Past 14 filters the row
+  scrolls sideways.
+- **Graph** (the pulse button in the rack footer) toggles a panel showing the
+  combined frequency response of every enabled linear module (EQs, filters,
+  loudness, gain) as a solid curve, the selected module's own curve dashed
+  when it differs, and a live spectrum of the processed output behind them.
+  Dynamics, saturation and space modules have no fixed response and are not
+  drawn. The analyser only runs while the panel is visible.
 
 ## How it works
 

@@ -3,6 +3,7 @@ import SwiftUI
 import CoreAudio
 import UniformTypeIdentifiers
 import Combine
+import Accelerate
 
 // MARK: - Device model
 
@@ -203,6 +204,66 @@ enum Action: Equatable { case fix, restart, reset, rack }
 final class Meters: ObservableObject {
     @Published var input: Float = 0
     @Published var output: Float = 0
+    /// Output spectrum in dBFS per log-spaced bin (20 Hz–20 kHz); empty while the graph is hidden.
+    @Published var spectrum: [Float] = []
+    /// Set by the graph view; the analyser only runs while something is looking at it.
+    var wantsSpectrum = false
+
+    static let bins = 96
+    private let n = RealtimeDSP.scopeFrames
+    private let samples: UnsafeMutablePointer<Float>
+    private let window: [Float]
+    private var windowed: [Float], real: [Float], imag: [Float], magnitudes: [Float]
+    private let fft: vDSP.FFT<DSPSplitComplex>
+    private var smoothed = [Float](repeating: -100, count: Meters.bins)
+
+    init() {
+        samples = .allocate(capacity: n)
+        samples.initialize(repeating: 0, count: n)
+        window = vDSP.window(ofType: Float.self, usingSequence: .hanningDenormalized, count: n, isHalfWindow: false)
+        windowed = [Float](repeating: 0, count: n)
+        real = [Float](repeating: 0, count: n / 2)
+        imag = [Float](repeating: 0, count: n / 2)
+        magnitudes = [Float](repeating: 0, count: n / 2)
+        fft = vDSP.FFT(log2n: vDSP_Length(log2(Float(n))), radix: .radix2, ofType: DSPSplitComplex.self)!
+    }
+
+    deinit { samples.deallocate() }
+
+    /// Reads the engine's scope ring, windows, FFTs, and folds the linear bins into
+    /// log-spaced bars with a fast-attack, slow-release smoother.
+    func analyse(sampleRate: Double, read: (UnsafeMutablePointer<Float>) -> Bool) {
+        guard wantsSpectrum, read(samples) else {
+            if !spectrum.isEmpty { spectrum = []; smoothed = [Float](repeating: -100, count: Meters.bins) }
+            return
+        }
+        vDSP.multiply(UnsafeBufferPointer(start: samples, count: n), window, result: &windowed)
+        // Pack the real windowed signal into split-complex form for the real FFT.
+        windowed.withUnsafeBufferPointer { src in
+            src.baseAddress!.withMemoryRebound(to: DSPComplex.self, capacity: n / 2) { complex in
+                real.withUnsafeMutableBufferPointer { r in imag.withUnsafeMutableBufferPointer { i in
+                    var split = DSPSplitComplex(realp: r.baseAddress!, imagp: i.baseAddress!)
+                    vDSP_ctoz(complex, 2, &split, 1, vDSP_Length(n / 2))
+                    fft.forward(input: split, output: &split)
+                    vDSP.squareMagnitudes(split, result: &magnitudes)
+                } }
+            }
+        }
+        let binHz = sampleRate / Double(n)
+        let scale = 1 / Float(n) * 2   // Hann coherent gain and one-sided spectrum
+        var bars = [Float](repeating: -100, count: Meters.bins)
+        for b in 0..<Meters.bins {
+            let f0 = 20 * pow(1000, Double(b) / Double(Meters.bins)), f1 = 20 * pow(1000, Double(b + 1) / Double(Meters.bins))
+            let i0 = max(1, Int(f0 / binHz)), i1 = max(i0 + 1, Int(f1 / binHz))
+            var peak: Float = 0
+            for i in i0..<min(i1, n / 2) { peak = max(peak, magnitudes[i]) }
+            bars[b] = 10 * log10(max(1e-10, peak * scale * scale))
+        }
+        for b in 0..<Meters.bins {
+            smoothed[b] = bars[b] > smoothed[b] ? bars[b] : smoothed[b] - 2.5
+        }
+        spectrum = smoothed
+    }
 }
 
 final class AudioState: ObservableObject {
@@ -284,6 +345,7 @@ final class AudioState: ObservableObject {
             let i = self.rackOn ? self.engine.inputPeak : 0, o = self.rackOn ? self.engine.outputPeak : 0
             if abs(i - self.meters.input) > 0.002 { self.meters.input = i }
             if abs(o - self.meters.output) > 0.002 { self.meters.output = o }
+            self.meters.analyse(sampleRate: self.rackTarget?.rate ?? 48_000) { self.rackOn && self.engine.scopeSnapshot(into: $0) }
         }
     }
 
@@ -439,11 +501,16 @@ final class AudioState: ObservableObject {
             mutate(&module.bands[i])
         }
     }
-    func addBand(_ id: UUID) {
+    @discardableResult
+    func addBand(_ id: UUID) -> UUID? {
+        var added: UUID?
         updateModule(id) { module in
             guard module.bands.count < 32 else { return }
-            module.bands.insert(EQBand(type: .peaking, frequency: 1_000, gainDB: 0, q: 1), at: 0)
+            let band = EQBand(type: .peaking, frequency: 1_000, gainDB: 0, q: 1)
+            module.bands.insert(band, at: 0)
+            added = band.id
         }
+        return added
     }
     func removeBand(_ id: UUID, _ bandID: UUID) { updateModule(id) { $0.bands.removeAll { $0.id == bandID } } }
     func resetModule(_ id: UUID) {

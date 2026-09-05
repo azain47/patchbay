@@ -27,35 +27,38 @@ final class Theme: ObservableObject {
         var title: String { rawValue.capitalized }
     }
 
-    /// `auto` picks per page: list pages are compact, the rack is spacious.
+    /// `auto` picks per page: list pages are compact, the rack is spacious, at one width
+    /// so switching tabs never jumps horizontally.
     enum Density: String, CaseIterable, Identifiable {
         case auto, compact, comfortable, spacious
         var id: String { rawValue }
         var title: String { rawValue.capitalized }
 
-        func resolved(for tab: Tab) -> Density {
-            guard self == .auto else { return self }
-            return tab == .rack ? .spacious : .compact
+        func metrics(for tab: Tab) -> Metrics {
+            guard self == .auto else { return metrics }
+            var m = (tab == .rack ? Density.spacious : .compact).metrics
+            m.width = 480
+            return m
         }
 
         var metrics: Metrics {
             switch self {
             case .auto, .compact:
                 Metrics(width: 400, maxHeight: 480, gutter: 12, rowV: 3, rowGap: 0, badge: 22, name: 12, mono: 10,
-                        headerV: 8, sectionTop: 8, paramH: 20, gap: 6, bandV: 4, subtitle: false)
+                        sectionTop: 8, paramH: 20, gap: 6, bandV: 4, faderH: 84, subtitle: false)
             case .comfortable:
                 Metrics(width: 460, maxHeight: 560, gutter: 16, rowV: 6, rowGap: 2, badge: 26, name: 13, mono: 10.5,
-                        headerV: 12, sectionTop: 12, paramH: 24, gap: 10, bandV: 7, subtitle: true)
+                        sectionTop: 12, paramH: 24, gap: 10, bandV: 7, faderH: 100, subtitle: true)
             case .spacious:
                 Metrics(width: 540, maxHeight: 640, gutter: 20, rowV: 9, rowGap: 4, badge: 30, name: 13.5, mono: 11,
-                        headerV: 16, sectionTop: 16, paramH: 28, gap: 14, bandV: 10, subtitle: true)
+                        sectionTop: 16, paramH: 28, gap: 14, bandV: 10, faderH: 120, subtitle: true)
             }
         }
     }
-    /// Everything that makes a layout dense or airy. The popover width is fixed per
-    /// density; height follows content up to `maxHeight`.
+    /// Everything that makes a page dense or airy. Height follows content up to `maxHeight`.
     struct Metrics {
-        let width, maxHeight, gutter, rowV, rowGap, badge, name, mono, headerV, sectionTop, paramH, gap, bandV: CGFloat
+        var width: CGFloat
+        let maxHeight, gutter, rowV, rowGap, badge, name, mono, sectionTop, paramH, gap, bandV, faderH: CGFloat
         let subtitle: Bool
     }
 
@@ -159,8 +162,7 @@ struct Root: View {
     @State private var tab: Tab = .output
 
     var body: some View {
-        let density = theme.density.resolved(for: tab)
-        let _ = (T.m = density.metrics)
+        let _ = (T.m = theme.density.metrics(for: tab))
         VStack(spacing: 0) {
             HStack(spacing: 14) {
                 Wordmark()
@@ -174,21 +176,22 @@ struct Root: View {
                         .disabled(audio.active != nil)
                 }
             }
-            .padding(.horizontal, T.padding).padding(.vertical, T.m.headerV)
+            .padding(.horizontal, 16).padding(.vertical, 12)
 
             Rectangle().fill(T.hairline).frame(height: 0.5)
 
             ZStack(alignment: .top) {
                 switch tab {
-                case .output: OutputTab(audio: audio)
-                case .input: InputTab(audio: audio)
-                case .rack: RackTab(audio: audio)
-                case .fix: FixTab(audio: audio)
+                case .output: OutputTab(audio: audio).transition(.opacity)
+                case .input: InputTab(audio: audio).transition(.opacity)
+                case .rack: RackTab(audio: audio).transition(.opacity)
+                case .fix: FixTab(audio: audio).transition(.opacity)
                 }
             }
+            .animation(T.tab, value: tab)
 
             Rectangle().fill(T.hairline).frame(height: 0.5)
-            Footer(audio: audio, theme: theme).id(density)
+            Footer(audio: audio, theme: theme)
         }
         .frame(width: T.width)
         .frame(maxHeight: T.m.maxHeight)
@@ -260,7 +263,7 @@ struct Footer: View {
             .popover(isPresented: $showSettings, arrowEdge: .bottom) { SettingsPopout(audio: audio, theme: theme) }
             Button("Quit") { NSApp.terminate(nil) }.font(.system(size: 11)).foregroundStyle(.tertiary).buttonStyle(.plain)
         }
-        .padding(.horizontal, T.padding).padding(.vertical, T.m.rowV + 3)
+        .padding(.horizontal, 16).padding(.vertical, 9)
     }
 }
 
@@ -656,17 +659,27 @@ struct ParamRow: View {
 
 struct RackTab: View {
     @ObservedObject var audio: AudioState
+    @AppStorage("showGraph") private var showGraph = false
 
     var body: some View {
         VStack(spacing: 0) {
             ChainStrip(audio: audio)
             Rectangle().fill(T.hairline).frame(height: 0.5)
+            if showGraph {
+                Graph(audio: audio)
+                    .frame(height: T.m.faderH + 40)
+                    .padding(.horizontal, T.padding).padding(.vertical, T.m.gap)
+                    .transition(.opacity)
+                Rectangle().fill(T.hairline).frame(height: 0.5)
+            }
             ModuleEditor(audio: audio).frame(maxWidth: .infinity)
 
             Rectangle().fill(T.hairline).frame(height: 0.5)
 
             HStack(spacing: 12) {
                 MeterPair(meters: audio.meters)
+                IconButton("waveform.path.ecg", active: showGraph) { withAnimation(T.quick) { showGraph.toggle() } }
+                    .help(showGraph ? "Hide graph" : "Show response and spectrum")
                 Button { audio.setBypass(!audio.rack.bypass) } label: {
                     Text("Bypass").font(.system(size: 11, weight: .medium))
                         .foregroundStyle(audio.rack.bypass ? Color.black.opacity(0.85) : .secondary)
@@ -826,23 +839,99 @@ struct ModuleEditor: View {
 
 struct IconButton: View {
     let symbol: String
+    var active = false
     let action: () -> Void
     @State private var hover = false
-    init(_ symbol: String, action: @escaping () -> Void) { self.symbol = symbol; self.action = action }
+    init(_ symbol: String, active: Bool = false, action: @escaping () -> Void) { self.symbol = symbol; self.active = active; self.action = action }
     var body: some View {
         Button(action: action) {
             Image(systemName: symbol).font(.system(size: 10, weight: .medium))
-                .foregroundStyle(hover ? .primary : .secondary).frame(width: 24, height: 22)
-                .background(RoundedRectangle(cornerRadius: 6).fill(hover ? T.hover : .clear))
+                .foregroundStyle(active ? T.accent : (hover ? .primary : .secondary)).frame(width: 24, height: 22)
+                .background(RoundedRectangle(cornerRadius: 6).fill(active ? T.press : (hover ? T.hover : .clear)))
         }
         .buttonStyle(Press()).onHover { hover = $0 }.animation(T.hoverAnim, value: hover)
     }
+}
+
+/// Response of the chain's linear stages over a live output spectrum.
+/// The selected module's own curve is drawn on top when it is an EQ or filter.
+struct Graph: View {
+    @ObservedObject var audio: AudioState
+    @ObservedObject private var meters: Meters
+    init(audio: AudioState) { self.audio = audio; self.meters = audio.meters }
+
+    private static let fMin = 20.0, fMax = 20_000.0
+    private static let points = 160
+
+    var body: some View {
+        let chain = (0..<Self.points).map { i -> Double in
+            audio.rack.responseDB(at: Self.frequency(at: Double(i) / Double(Self.points - 1)))
+        }
+        let selected: [Double]? = audio.selected.flatMap { m in
+            m.linearCascade == nil || audio.rack.modules.filter({ $0.enabled && $0.linearCascade != nil }).count < 2 ? nil
+                : (0..<Self.points).map { i in m.responseDB(at: Self.frequency(at: Double(i) / Double(Self.points - 1))) }
+        }
+        let range = max(6, (chain + (selected ?? [])).map { abs($0) }.max() ?? 0).rounded(.up)
+        let spectrum = meters.spectrum
+        Canvas { ctx, size in
+            let w = size.width, h = size.height
+            func y(_ db: Double) -> CGFloat { h / 2 - CGFloat(db / range) * (h / 2 - 8) }
+            func x(_ f: Double) -> CGFloat { CGFloat(log(f / Self.fMin) / log(Self.fMax / Self.fMin)) * w }
+
+            // Spectrum: dBFS -90…0 across the full height.
+            if !spectrum.isEmpty {
+                var bars = Path()
+                let bw = w / CGFloat(spectrum.count)
+                for (i, db) in spectrum.enumerated() {
+                    let t = CGFloat(max(0, min(1, (Double(db) + 90) / 90)))
+                    bars.addRect(CGRect(x: CGFloat(i) * bw + 0.5, y: h - t * h, width: max(1, bw - 1), height: t * h))
+                }
+                ctx.fill(bars, with: .color(T.accent.opacity(0.16)))
+            }
+
+            // Grid.
+            var grid = Path()
+            for f in [50.0, 100, 200, 500, 1_000, 2_000, 5_000, 10_000] { grid.move(to: CGPoint(x: x(f), y: 0)); grid.addLine(to: CGPoint(x: x(f), y: h)) }
+            ctx.stroke(grid, with: .color(Color.primary.opacity(0.05)), lineWidth: 0.5)
+            var zero = Path(); zero.move(to: CGPoint(x: 0, y: h / 2)); zero.addLine(to: CGPoint(x: w, y: h / 2))
+            ctx.stroke(zero, with: .color(Color.primary.opacity(0.14)), lineWidth: 0.5)
+            for f in [100.0, 1_000, 10_000] {
+                ctx.draw(Text(f >= 1000 ? "\(Int(f / 1000))k" : "\(Int(f))").font(T.monoSmall).foregroundStyle(.quaternary),
+                         at: CGPoint(x: x(f) + 3, y: h - 7), anchor: .leading)
+            }
+            ctx.draw(Text(String(format: "±%.0f dB", range)).font(T.monoSmall).foregroundStyle(.quaternary), at: CGPoint(x: w - 3, y: 7), anchor: .trailing)
+
+            func curve(_ values: [Double]) -> Path {
+                var p = Path()
+                for (i, db) in values.enumerated() {
+                    let pt = CGPoint(x: CGFloat(i) / CGFloat(values.count - 1) * w, y: y(db))
+                    i == 0 ? p.move(to: pt) : p.addLine(to: pt)
+                }
+                return p
+            }
+            if let selected { ctx.stroke(curve(selected), with: .color(Color.primary.opacity(0.35)), style: StrokeStyle(lineWidth: 1, dash: [3, 3])) }
+            var fill = curve(chain)
+            fill.addLine(to: CGPoint(x: w, y: h / 2)); fill.addLine(to: CGPoint(x: 0, y: h / 2)); fill.closeSubpath()
+            ctx.fill(fill, with: .color(T.accent.opacity(0.12)))
+            ctx.stroke(curve(chain), with: .color(T.accent), lineWidth: 1.5)
+        }
+        .background(RoundedRectangle(cornerRadius: 8).fill(T.card))
+        .overlay(RoundedRectangle(cornerRadius: 8).strokeBorder(T.hairline, lineWidth: 0.5))
+        .onAppear { meters.wantsSpectrum = true }
+        .onDisappear { meters.wantsSpectrum = false }
+    }
+
+    private static func frequency(at t: Double) -> Double { fMin * pow(fMax / fMin, t) }
 }
 
 struct ParametricEditor: View {
     @ObservedObject var audio: AudioState
     let module: RackModule
     @State private var query = ""
+    @State private var selectedBand: UUID?
+
+    private var bands: [EQBand] { module.bands.sorted { $0.frequency < $1.frequency } }
+    private var current: EQBand? { bands.first { $0.id == selectedBand } ?? bands.first }
 
     var body: some View {
         VStack(alignment: .leading, spacing: T.m.gap) {
@@ -862,26 +951,114 @@ struct ParametricEditor: View {
                 AutoEQResults(audio: audio, query: query) { query = "" }
             }
 
+            BandColumns(bands: bands, selected: current?.id, height: T.m.faderH,
+                        select: { selectedBand = $0 },
+                        setGain: { id, g in audio.setBand(module.id, id) { $0.gainDB = g } })
+
+            if let band = current {
+                BandDetail(band: band,
+                           setType: { t in audio.setBand(module.id, band.id) { $0.type = t } },
+                           setFreq: { f in audio.setBand(module.id, band.id) { $0.frequency = f } },
+                           setQ: { q in audio.setBand(module.id, band.id) { $0.q = q } },
+                           toggle: { audio.setBand(module.id, band.id) { $0.enabled.toggle() } },
+                           remove: { audio.removeBand(module.id, band.id); selectedBand = nil })
+            }
+
             HStack {
                 Text("\(module.bands.count) filters").font(T.monoSmall).foregroundStyle(.tertiary)
                 Spacer()
-                Button { audio.addBand(module.id) } label: { Label("Add filter", systemImage: "plus").font(.system(size: 11)) }
+                Button { selectedBand = audio.addBand(module.id) } label: { Label("Add filter", systemImage: "plus").font(.system(size: 11)) }
                     .buttonStyle(.plain).foregroundStyle(.secondary)
-            }
-            .padding(.top, 2)
-
-            ForEach(module.bands) { band in
-                BandRow(band: band,
-                        setType: { t in audio.setBand(module.id, band.id) { $0.type = t } },
-                        setFreq: { f in audio.setBand(module.id, band.id) { $0.frequency = f } },
-                        setGain: { g in audio.setBand(module.id, band.id) { $0.gainDB = g } },
-                        setQ: { q in audio.setBand(module.id, band.id) { $0.q = q } },
-                        toggle: { audio.setBand(module.id, band.id) { $0.enabled.toggle() } },
-                        remove: { audio.removeBand(module.id, band.id) })
-                    .transition(.opacity.combined(with: .scale(scale: 0.98, anchor: .top)))
             }
         }
         .animation(T.quick, value: module.bands.map(\.id))
+        .animation(T.quick, value: selectedBand)
+    }
+}
+
+/// One vertical gain fader per band, low frequencies on the left. Tap a column to
+/// edit its type, frequency and Q below.
+struct BandColumns: View {
+    let bands: [EQBand]
+    let selected: UUID?
+    let height: CGFloat
+    let select: (UUID) -> Void
+    let setGain: (UUID, Double) -> Void
+
+    var body: some View {
+        let dense = bands.count > 14
+        let columns = HStack(alignment: .bottom, spacing: dense ? 4 : 6) {
+            ForEach(bands) { band in
+                BandColumn(band: band, selected: band.id == selected, height: height,
+                           select: { select(band.id) }, setGain: { setGain(band.id, $0) })
+                    .frame(width: dense ? 30 : nil).frame(maxWidth: dense ? nil : .infinity)
+            }
+        }
+        .padding(.vertical, 8).padding(.horizontal, 6)
+        Group {
+            if dense { ScrollView(.horizontal, showsIndicators: false) { columns } } else { columns }
+        }
+        .background(RoundedRectangle(cornerRadius: 9).fill(T.card))
+        .overlay {
+            if bands.isEmpty { Text("No filters").font(T.mono).foregroundStyle(.tertiary) }
+        }
+    }
+}
+
+struct BandColumn: View {
+    let band: EQBand
+    let selected: Bool
+    let height: CGFloat
+    let select: () -> Void
+    let setGain: (Double) -> Void
+
+    var body: some View {
+        VStack(spacing: 5) {
+            Text(band.type.usesGain ? String(format: "%+.0f", band.gainDB) : "·")
+                .font(T.monoSmall).foregroundStyle(selected ? .primary : .tertiary).lineLimit(1)
+            VFader(value: band.gainDB, range: -18...18) { setGain(($0 * 2).rounded() / 2) }
+                .frame(height: height)
+                .opacity(band.type.usesGain ? 1 : 0.3)
+                .disabled(!band.type.usesGain)
+            Text(band.frequency >= 1000 ? String(format: "%.1fk", band.frequency / 1000) : String(format: "%.0f", band.frequency))
+                .font(T.monoSmall).foregroundStyle(selected ? .primary : .tertiary).lineLimit(1).minimumScaleFactor(0.7)
+            Circle().fill(band.enabled ? T.accent : Color.primary.opacity(0.18)).frame(width: 5, height: 5)
+        }
+        .padding(.vertical, 4)
+        .background(RoundedRectangle(cornerRadius: 6).fill(selected ? T.press : .clear))
+        .contentShape(Rectangle())
+        .onTapGesture(perform: select)
+        .opacity(band.enabled ? 1 : 0.55)
+    }
+}
+
+struct BandDetail: View {
+    let band: EQBand
+    let setType: (FilterType) -> Void
+    let setFreq: (Double) -> Void
+    let setQ: (Double) -> Void
+    let toggle: () -> Void
+    let remove: () -> Void
+
+    var body: some View {
+        HStack(spacing: 10) {
+            Button(action: toggle) {
+                Circle().fill(band.enabled ? T.accent : Color.primary.opacity(0.18)).frame(width: 7, height: 7).frame(width: 14, height: 14).contentShape(Rectangle())
+            }.buttonStyle(.plain).help(band.enabled ? "Disable filter" : "Enable filter")
+            Picker("", selection: Binding(get: { band.type }, set: setType)) {
+                ForEach(FilterType.allCases) { Text($0.rawValue).tag($0) }
+            }
+            .labelsHidden().controlSize(.small).frame(width: 92)
+            Fader(value: band.frequency, range: 20...20_000, log: true, set: setFreq)
+            Text(band.frequency >= 1000 ? String(format: "%.2fk", band.frequency / 1000) : String(format: "%.0f", band.frequency))
+                .font(T.mono).foregroundStyle(.secondary).frame(width: 46, alignment: .trailing)
+            Text("Q").font(T.monoSmall).foregroundStyle(.tertiary)
+            Fader(value: band.q, range: 0.1...12, log: true, set: setQ).frame(width: T.m.subtitle ? 80 : 56)
+            Text(String(format: "%.2f", band.q)).font(T.mono).foregroundStyle(.secondary).frame(width: 34, alignment: .trailing)
+            IconButton("xmark") { remove() }.help("Remove filter")
+        }
+        .padding(.vertical, T.m.bandV).padding(.horizontal, 8)
+        .background(RoundedRectangle(cornerRadius: 8).fill(T.card))
     }
 }
 
@@ -930,49 +1107,6 @@ struct AutoEQResults: View {
         }
         .background(RoundedRectangle(cornerRadius: 8).fill(T.card))
         .overlay(RoundedRectangle(cornerRadius: 8).strokeBorder(T.hairline, lineWidth: 0.5))
-    }
-}
-
-struct BandRow: View {
-    let band: EQBand
-    let setType: (FilterType) -> Void
-    let setFreq: (Double) -> Void
-    let setGain: (Double) -> Void
-    let setQ: (Double) -> Void
-    let toggle: () -> Void
-    let remove: () -> Void
-    @State private var hover = false
-
-    var body: some View {
-        VStack(spacing: T.m.bandV - 1) {
-            HStack(spacing: 10) {
-                Button(action: toggle) {
-                    Circle().fill(band.enabled ? T.accent : Color.primary.opacity(0.18)).frame(width: 7, height: 7).frame(width: 14, height: 14).contentShape(Rectangle())
-                }.buttonStyle(.plain)
-                Picker("", selection: Binding(get: { band.type }, set: setType)) {
-                    ForEach(FilterType.allCases) { Text($0.rawValue).tag($0) }
-                }
-                .labelsHidden().controlSize(.small).frame(width: 92)
-                Fader(value: band.frequency, range: 20...20_000, log: true, set: setFreq)
-                Text(band.frequency >= 1000 ? String(format: "%.2fk", band.frequency / 1000) : String(format: "%.0f", band.frequency))
-                    .font(T.mono).foregroundStyle(.secondary).frame(width: 46, alignment: .trailing)
-                IconButton("xmark") { remove() }.opacity(hover ? 1 : 0.25)
-            }
-            HStack(spacing: 10) {
-                Color.clear.frame(width: 14)
-                Text("Gain").font(T.monoSmall).foregroundStyle(.tertiary).frame(width: 30, alignment: .leading)
-                Fader(value: band.gainDB, range: -18...18, center: 0, set: setGain).opacity(band.type.usesGain ? 1 : 0.35).disabled(!band.type.usesGain)
-                Text(String(format: "%+.1f", band.gainDB)).font(T.mono).foregroundStyle(.secondary).frame(width: 40, alignment: .trailing)
-                Text("Q").font(T.monoSmall).foregroundStyle(.tertiary).frame(width: 12, alignment: .leading)
-                Fader(value: band.q, range: 0.1...12, log: true, set: setQ).frame(width: 90)
-                Text(String(format: "%.2f", band.q)).font(T.mono).foregroundStyle(.secondary).frame(width: 36, alignment: .trailing)
-            }
-        }
-        .padding(.vertical, T.m.bandV).padding(.horizontal, 8)
-        .background(RoundedRectangle(cornerRadius: 8).fill(hover ? T.hover : T.card))
-        .opacity(band.enabled ? 1 : 0.5)
-        .onHover { hover = $0 }
-        .animation(T.hoverAnim, value: hover)
     }
 }
 

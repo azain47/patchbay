@@ -1,6 +1,9 @@
 import AudioToolbox
 import CoreAudio
 import Foundation
+import os
+
+let engineLog = Logger(subsystem: "com.patchbay.app", category: "engine")
 
 final class SystemAudioEngine {
     enum Status: Equatable {
@@ -32,13 +35,22 @@ final class SystemAudioEngine {
     var onStatus: ((Status) -> Void)?
     var onNeedsRestart: (() -> Void)?
     private(set) var status: Status = .stopped {
-        didSet { DispatchQueue.main.async { [status, weak self] in self?.onStatus?(status) } }
+        didSet {
+            engineLog.info("status \(String(describing: self.status), privacy: .public)")
+            DispatchQueue.main.async { [status, weak self] in self?.onStatus?(status) }
+        }
     }
     private(set) var outputUID: String?
     private(set) var sampleRate = 48_000.0
     private(set) var diagnostics = Diagnostics()
     var inputPeak: Float { processor?.inputPeak ?? 0 }
     var outputPeak: Float { processor?.outputPeak ?? 0 }
+    /// Last `RealtimeDSP.scopeFrames` output samples, oldest first; false when idle.
+    func scopeSnapshot(into: UnsafeMutablePointer<Float>) -> Bool {
+        guard let processor else { return false }
+        processor.scopeSnapshot(into: into)
+        return true
+    }
 
     private var tapID = AudioObjectID(kAudioObjectUnknown)
     private var aggregateID = AudioObjectID(kAudioObjectUnknown)
@@ -55,6 +67,7 @@ final class SystemAudioEngine {
     deinit { stop() }
 
     func start(output: Device, settings: RackSettings) {
+        engineLog.info("start on \(output.name, privacy: .public) mode \(self.tapMode.rawValue, privacy: .public) proven \(self.captureProven)")
         stopResources()
         self.settings = settings
         outputUID = output.uid
@@ -73,6 +86,7 @@ final class SystemAudioEngine {
     }
 
     func stop() {
+        engineLog.info("stop")
         stopResources()
         outputUID = nil
         captureProven = false
