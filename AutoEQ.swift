@@ -31,7 +31,11 @@ final class AutoEQCatalog: ObservableObject {
         if !force, let attrs = try? FileManager.default.attributesOfItem(atPath: cacheURL.path),
            let modified = attrs[.modificationDate] as? Date, Date().timeIntervalSince(modified) < 7 * 86_400,
            let text = try? String(contentsOf: cacheURL, encoding: .utf8) {
-            apply(text)
+            state = .loading
+            DispatchQueue.global(qos: .userInitiated).async { [weak self] in
+                let parsed = Self.parse(text)
+                DispatchQueue.main.async { self?.entries = parsed; self?.state = .ready(parsed.count) }
+            }
             return
         }
         state = .loading
@@ -43,12 +47,15 @@ final class AutoEQCatalog: ObservableObject {
                     return
                 }
                 try? data.write(to: self.cacheURL)
-                self.apply(text)
+                DispatchQueue.global(qos: .userInitiated).async { [weak self] in
+                    let parsed = Self.parse(text)
+                    DispatchQueue.main.async { self?.entries = parsed; self?.state = .ready(parsed.count) }
+                }
             }
         }.resume()
     }
 
-    private func apply(_ text: String) {
+    private static func parse(_ text: String) -> [Entry] {
         var parsed: [Entry] = []
         for line in text.split(whereSeparator: \.isNewline) {
             // - [Name](./Source/Rig type/Name) by Source on Rig
@@ -61,8 +68,7 @@ final class AutoEQCatalog: ObservableObject {
             let rig = parts.count >= 3 ? parts[1].replacingOccurrences(of: " in-ear", with: "").replacingOccurrences(of: " over-ear", with: "").replacingOccurrences(of: " earbud", with: "") : ""
             parsed.append(Entry(name: name, path: path, source: source, rig: rig == "in-ear" || rig == "over-ear" || rig == "earbud" ? "" : rig))
         }
-        entries = parsed
-        state = .ready(parsed.count)
+        return parsed
     }
 
     func search(_ query: String, limit: Int = 40) -> [Entry] {

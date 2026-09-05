@@ -120,6 +120,30 @@ enum CA {
         }
     }
 
+    static func mute(_ id: AudioDeviceID, input: Bool) -> Bool? {
+        let scope = input ? kAudioObjectPropertyScopeInput : kAudioObjectPropertyScopeOutput
+        for element: UInt32 in [kAudioObjectPropertyElementMain, 1] {
+            var a = AudioObjectPropertyAddress(mSelector: kAudioDevicePropertyMute, mScope: scope, mElement: element)
+            guard AudioObjectHasProperty(id, &a) else { continue }
+            var v: UInt32 = 0; var s = UInt32(MemoryLayout<UInt32>.size)
+            if AudioObjectGetPropertyData(id, &a, 0, nil, &s, &v) == noErr { return v != 0 }
+        }
+        return nil
+    }
+
+    static func setMute(_ id: AudioDeviceID, input: Bool, _ muted: Bool) -> Bool {
+        let scope = input ? kAudioObjectPropertyScopeInput : kAudioObjectPropertyScopeOutput
+        var v: UInt32 = muted ? 1 : 0
+        var any = false
+        for element: UInt32 in [kAudioObjectPropertyElementMain, 1, 2] {
+            var a = AudioObjectPropertyAddress(mSelector: kAudioDevicePropertyMute, mScope: scope, mElement: element)
+            guard AudioObjectHasProperty(id, &a) else { continue }
+            if AudioObjectSetPropertyData(id, &a, 0, nil, UInt32(MemoryLayout<UInt32>.size), &v) == noErr { any = true }
+            if element == kAudioObjectPropertyElementMain, any { break }
+        }
+        return any
+    }
+
     static func bestReal(from devs: [Device]) -> Device? {
         let real = devs.filter { !$0.isEqMac }
         if let eq = devs.first(where: { $0.isEqMac && $0.isDefault }) {
@@ -153,7 +177,16 @@ enum CA {
 
 enum Action: Equatable { case fix, restart, reset, rack }
 
+/// Meter levels live on their own object so 30 Hz updates only re-render meter views.
+final class Meters: ObservableObject {
+    @Published var input: Float = 0
+    @Published var output: Float = 0
+}
+
 final class AudioState: ObservableObject {
+    let meters = Meters()
+    @Published var micMuted = false
+    private var micVolumeBeforeMute: Float = 1
     @Published var outputs: [Device] = []
     @Published var inputs: [Device] = []
     @Published var eqMacOn = false
@@ -162,8 +195,6 @@ final class AudioState: ObservableObject {
     @Published var rack = RackSettings.neutral
     @Published var rackOn = false
     @Published var rackStatus: SystemAudioEngine.Status = .stopped
-    @Published var inputPeak: Float = 0
-    @Published var outputPeak: Float = 0
     @Published var selectedModule: UUID?
     @Published var inputVolume: Float = 1
     @Published var outputVolume: Float?
@@ -208,11 +239,6 @@ final class AudioState: ObservableObject {
             listeners.append((sel, block))
         }
         timer = Timer.scheduledTimer(withTimeInterval: 10, repeats: true) { [weak self] _ in DispatchQueue.main.async { self?.updateHealth() } }
-        meterTimer = Timer.scheduledTimer(withTimeInterval: 1.0 / 30, repeats: true) { [weak self] _ in
-            guard let self else { return }
-            self.inputPeak = self.rackOn ? self.engine.inputPeak : 0
-            self.outputPeak = self.rackOn ? self.engine.outputPeak : 0
-        }
         wakeObserver = NSWorkspace.shared.notificationCenter.addObserver(forName: NSWorkspace.didWakeNotification, object: nil, queue: .main) { [weak self] _ in
             guard let self, self.rackOn, let target = self.rackTarget else { return }
             self.engine.start(output: target, settings: self.rack)
@@ -223,6 +249,18 @@ final class AudioState: ObservableObject {
             UserDefaults.standard.set(tapMode.rawValue, forKey: "tapMode")
             engine.tapMode = tapMode
             if rackOn, let target = rackTarget { engine.start(output: target, settings: rack) }
+        }
+    }
+
+    /// Meters only tick while the popover is visible.
+    func setVisible(_ visible: Bool) {
+        meterTimer?.invalidate(); meterTimer = nil
+        guard visible else { return }
+        meterTimer = Timer.scheduledTimer(withTimeInterval: 1.0 / 30, repeats: true) { [weak self] _ in
+            guard let self else { return }
+            let i = self.rackOn ? self.engine.inputPeak : 0, o = self.rackOn ? self.engine.outputPeak : 0
+            if abs(i - self.meters.input) > 0.002 { self.meters.input = i }
+            if abs(o - self.meters.output) > 0.002 { self.meters.output = o }
         }
     }
 
@@ -242,16 +280,32 @@ final class AudioState: ObservableObject {
         inputs = CA.devices(input: true)
         if let input = currentInput { inputVolume = CA.volume(input.id, input: true) ?? 1 }
         if let output = currentOutput { outputVolume = CA.volume(output.id, input: false) }
-        eqMacOn = Self.alive("eqMac")
+        if let input = currentInput { micMuted = CA.mute(input.id, input: true) ?? (inputVolume == 0 && micVolumeBeforeMute > 0) }
         updateHealth()
         synchronizeRackDevice()
     }
 
+    /// pgrep on a background queue; the main thread never blocks on a process spawn.
     private func updateHealth() {
-        eqMacOn = Self.alive("eqMac")
-        let was = healthy
-        healthy = !((!eqMacOn) && (currentOutput?.isEqMac == true))
-        if was != healthy { onHealth?(healthy) }
+        let eqMacDefault = currentOutput?.isEqMac == true
+        DispatchQueue.global(qos: .utility).async { [weak self] in
+            let alive = Self.alive("eqMac")
+            DispatchQueue.main.async {
+                guard let self else { return }
+                self.eqMacOn = alive
+                let was = self.healthy
+                self.healthy = !((!alive) && eqMacDefault)
+                if was != self.healthy { self.onHealth?(self.healthy) }
+            }
+        }
+    }
+
+    func setMicMuted(_ muted: Bool) {
+        guard let input = currentInput else { return }
+        micMuted = muted
+        if CA.setMute(input.id, input: true, muted) { return }
+        // Device has no mute control: emulate with the gain slider.
+        if muted { micVolumeBeforeMute = inputVolume; setInputVolume(0) } else { setInputVolume(micVolumeBeforeMute > 0 ? micVolumeBeforeMute : 1) }
     }
 
     private func synchronizeRackDevice() {
@@ -519,7 +573,8 @@ final class Bar: NSObject, NSPopoverDelegate {
         super.init()
         item = NSStatusBar.system.statusItem(withLength: NSStatusItem.variableLength)
         pop = NSPopover()
-        pop.contentViewController = NSHostingController(rootView: Root(audio: audio))
+        pop.contentViewController = NSHostingController(rootView: Root(audio: audio, theme: Theme.shared))
+        Theme.shared.applyAppearance()
         pop.behavior = .transient
         pop.animates = true
         pop.delegate = self
@@ -541,6 +596,7 @@ final class Bar: NSObject, NSPopoverDelegate {
         guard let b = clicked ?? item.button else { return }
         pop.show(relativeTo: b.bounds, of: b, preferredEdge: .minY)
         pop.contentViewController?.view.window?.makeKey()
+        audio.setVisible(true)
         monitor = NSEvent.addGlobalMonitorForEvents(matching: [.leftMouseDown, .rightMouseDown]) { [weak self] _ in self?.hide() }
     }
 
@@ -550,6 +606,7 @@ final class Bar: NSObject, NSPopoverDelegate {
     }
 
     func popoverDidClose(_ notification: Notification) {
+        audio.setVisible(false)
         if let m = monitor { NSEvent.removeMonitor(m); monitor = nil }
     }
 }
