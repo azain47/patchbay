@@ -261,7 +261,7 @@ struct TabBar: View {
                         .background(Capsule().fill(tab == t ? T.press : .clear))
                         .contentShape(Capsule())
                 }
-                .buttonStyle(Press())
+                .buttonStyle(.plain)  // Press() animates on isPressed, which coincides with the tab change
                 .help(t.title)
             }
         }
