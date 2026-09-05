@@ -408,8 +408,11 @@ final class AudioState: ObservableObject {
     func addModule(_ kind: ModuleKind) {
         guard rack.modules.count < Int(PB_MAX_MODULES) else { notice = "Rack is full (\(PB_MAX_MODULES) modules)."; return }
         let module = RackModule(kind: kind)
-        update { $0.modules.append(module) }
+        // Keep signal order: after the last module that belongs at or before this stage, else first.
+        let at = rack.modules.lastIndex { $0.kind.stage <= kind.stage }.map { $0 + 1 } ?? 0
+        update { $0.modules.insert(module, at: at) }
         selectedModule = module.id
+        if at > 0 { notice = "\(kind.title) placed after \(rack.modules[at - 1].title)" }
     }
 
     func removeModule(_ id: UUID) {
@@ -439,7 +442,7 @@ final class AudioState: ObservableObject {
     func addBand(_ id: UUID) {
         updateModule(id) { module in
             guard module.bands.count < 32 else { return }
-            module.bands.append(EQBand(type: .peaking, frequency: 1_000, gainDB: 0, q: 1))
+            module.bands.insert(EQBand(type: .peaking, frequency: 1_000, gainDB: 0, q: 1), at: 0)
         }
     }
     func removeBand(_ id: UUID, _ bandID: UUID) { updateModule(id) { $0.bands.removeAll { $0.id == bandID } } }
@@ -606,12 +609,14 @@ final class Bar: NSObject, NSPopoverDelegate {
         super.init()
         item = NSStatusBar.system.statusItem(withLength: NSStatusItem.variableLength)
         pop = NSPopover()
-        pop.contentViewController = NSHostingController(rootView: Root(audio: audio, theme: Theme.shared))
+        let host = NSHostingController(rootView: Root(audio: audio, theme: Theme.shared))
+        host.sizingOptions = .preferredContentSize
+        pop.contentViewController = host
         appearanceSink = Theme.shared.$appearance.sink { [weak self] a in
             self?.pop.appearance = a == .system ? nil : NSAppearance(named: a == .dark ? .darkAqua : .aqua)
         }
         pop.behavior = .transient
-        pop.animates = true
+        pop.animates = false
         pop.delegate = self
         if let b = item.button {
             b.image = NSImage(systemSymbolName: "waveform", accessibilityDescription: "patchbay")

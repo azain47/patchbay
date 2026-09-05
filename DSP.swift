@@ -97,6 +97,37 @@ enum ModuleKind: String, Codable, CaseIterable, Identifiable {
         }
     }
 
+    /// Canonical slot in a signal chain, earliest first. Gain staging and noise
+    /// control act on the raw signal; correction (de-ess, filters, EQ) precedes
+    /// dynamics so the compressor sees the fixed tone; saturation follows dynamics
+    /// so harmonics are not pumped; stereo and time effects come last among the
+    /// creative stages so tails are not re-compressed; loudness compensation is a
+    /// playback-level EQ near the end; maximizer then limiter close the chain.
+    var stage: Int {
+        switch self {
+        case .gain: 0
+        case .gate: 1
+        case .expander: 2
+        case .deesser: 3
+        case .filter: 4
+        case .parametricEQ: 5
+        case .graphicEQ: 6
+        case .compressor: 7
+        case .autogain: 8
+        case .bassEnhancer: 9
+        case .exciter: 10
+        case .crystalizer: 11
+        case .crusher: 12
+        case .crossfeed: 13
+        case .stereoTools: 14
+        case .delay: 15
+        case .reverb: 16
+        case .loudness: 17
+        case .maximizer: 18
+        case .limiter: 19
+        }
+    }
+
     var group: String {
         switch self {
         case .gain, .parametricEQ, .graphicEQ, .filter, .loudness: "Tone"

@@ -3,8 +3,8 @@
 A native, open-source DSP rack for macOS system audio. No virtual audio driver.
 
 <p align="center">
-  <img src="screenshot.png" width="398" alt="patchbay devices page">
-  <img src="rack.png" width="666" alt="patchbay rack page with AutoEq profile">
+  <img src="screenshot.png" width="426" alt="patchbay devices page">
+  <img src="rack.png" width="566" alt="patchbay rack page with AutoEq profile">
 </p>
 
 ## What it does
@@ -14,12 +14,34 @@ A native, open-source DSP rack for macOS system audio. No virtual audio driver.
   - Character: Bass enhancer, Exciter, Crystalizer, Crusher
   - Dynamics: Compressor, Expander, Gate, De-esser, Limiter, Maximizer, Autogain
   - Space: Stereo tools, Crossfeed, Delay, Reverb (Freeverb)
+- **Contextual chain placement**: a new module lands where it belongs in the
+  signal path, after the last module of an earlier or equal stage. The order is
+  gain staging → gate/expander → de-esser → filter/EQ → compressor/autogain →
+  saturation → stereo/time effects → loudness → maximizer → limiter. Existing
+  modules are never moved; drag if you want something else. A new EQ filter is
+  inserted at the top of the list.
 - **AutoEq headphone correction**: search 8,800+ profiles from [jaakkopasanen/AutoEq](https://github.com/jaakkopasanen/AutoEq), applied as a parametric module in one click
 - **Equalizer APO import/export**: `ParametricEQ.txt` in, `ParametricEQ.txt` out
 - **Per-device chains**: every output device remembers its own rack
-- **Bypass** for instant A/B, input/output metering
-- **Output and input device switching**, hardware volume and mic gain
-- **eqMac recovery** tools (fix stuck audio, restart, reset Core Audio)
+- **Bypass** for instant A/B, input/output metering, **device sample rate** picker in the rack footer
+- **Output and input device switching**, hardware volume, mic gain and hardware mic mute
+- **eqMac recovery** tools (fix stuck audio, restart, reset Core Audio) on the Fix page
+
+## Interface
+
+One menu bar popover with four icon tabs: output, input, rack, fix. It opens
+and closes without animation; in-app motion is short springs.
+
+- **Layout** follows the page by default (*Auto*): the device pages are compact
+  and only as tall as their content; the rack is wide and spacious, capped at
+  640 pt with the module editor scrolling inside. *Compact*, *Comfortable* and
+  *Spacious* pin one density everywhere.
+- **Settings** live behind the gear in the footer: appearance (system, dark,
+  light — applied to the popover itself), layout, accent colour, and audio
+  capture topology.
+- The chain is a strip of chips above the module editor in signal order,
+  first stage on the left. Click to edit, drag to reorder, dot to bypass one
+  module.
 
 ## How it works
 
@@ -45,9 +67,12 @@ Safety properties of this design:
   config snapshots through an atomic pointer (`DSPConfig.c`); filter memory is
   kept across parameter changes so slider moves never click. Output is NaN-guarded.
 
-Tap topology is switchable from the rack footer (`⋯`): *Stereo mixdown*
-(default, works everywhere) or *Device stream* (tap bound to the hardware
-stream, no resampling; behaviour varies per device).
+Tap topology is chosen in Settings → Audio capture. *Stereo mixdown* (default)
+has Core Audio mix every process to one stereo stream in its own format, which
+patchbay processes and the aggregate resamples to the device rate when they
+differ; it works on every device. *Device stream* binds the tap to the output
+device's hardware stream, so the format matches exactly and nothing is
+resampled; cleaner on paper, but some devices deliver silence, so it is opt-in.
 
 ## Limits
 
