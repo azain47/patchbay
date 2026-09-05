@@ -27,22 +27,32 @@ final class Theme: ObservableObject {
         var title: String { rawValue.capitalized }
     }
 
+    enum Density: String, CaseIterable, Identifiable {
+        case compact, comfortable, spacious
+        var id: String { rawValue }
+        var title: String { rawValue.capitalized }
+        var metrics: Metrics {
+            switch self {
+            case .compact: Metrics(width: 420, height: 460, gutter: 14, rowV: 4, badge: 24, chain: 0, name: 12.5)
+            case .comfortable: Metrics(width: 480, height: 520, gutter: 16, rowV: 6, badge: 26, chain: 0, name: 13)
+            case .spacious: Metrics(width: 560, height: 584, gutter: 18, rowV: 8, badge: 28, chain: 206, name: 13)
+            }
+        }
+    }
+    struct Metrics { let width: CGFloat, height: CGFloat, gutter: CGFloat, rowV: CGFloat, badge: CGFloat, chain: CGFloat, name: CGFloat }
+
+    @Published var density: Density { didSet { UserDefaults.standard.set(density.rawValue, forKey: "density"); T.m = density.metrics } }
     @Published var accent: Accent { didSet { UserDefaults.standard.set(accent.rawValue, forKey: "accent"); T.accent = accent.color } }
-    @Published var appearance: Appearance { didSet { UserDefaults.standard.set(appearance.rawValue, forKey: "appearance"); applyAppearance() } }
+    @Published var appearance: Appearance { didSet { UserDefaults.standard.set(appearance.rawValue, forKey: "appearance") } }
 
     private init() {
         accent = Accent(rawValue: UserDefaults.standard.string(forKey: "accent") ?? "") ?? .amber
         appearance = Appearance(rawValue: UserDefaults.standard.string(forKey: "appearance") ?? "") ?? .system
+        density = Density(rawValue: UserDefaults.standard.string(forKey: "density") ?? "") ?? .comfortable
         T.accent = accent.color
+        T.m = density.metrics
     }
 
-    func applyAppearance() {
-        switch appearance {
-        case .system: NSApp.appearance = nil
-        case .dark: NSApp.appearance = NSAppearance(named: .darkAqua)
-        case .light: NSApp.appearance = NSAppearance(named: .aqua)
-        }
-    }
 }
 
 // MARK: - Tokens
@@ -57,8 +67,9 @@ enum T {
     static let card = Color.primary.opacity(0.045)
     static let hairline = Color.primary.opacity(0.09)
 
-    static let name = Font.system(size: 13, weight: .regular)
-    static let nameStrong = Font.system(size: 13, weight: .semibold)
+    static var m = Theme.Density.comfortable.metrics
+    static var name: Font { .system(size: m.name, weight: .regular) }
+    static var nameStrong: Font { .system(size: m.name, weight: .semibold) }
     static let mono = Font.system(size: 10.5, weight: .medium, design: .monospaced)
     static let monoSmall = Font.system(size: 9, weight: .medium, design: .monospaced)
     static let section = Font.system(size: 10, weight: .bold)
@@ -67,9 +78,9 @@ enum T {
     static let tab = Animation.spring(response: 0.26, dampingFraction: 0.9)
     static let hoverAnim = Animation.easeOut(duration: 0.12)
 
-    static let width: CGFloat = 600
-    static let height: CGFloat = 584
-    static let padding: CGFloat = 18
+    static var width: CGFloat { m.width }
+    static var height: CGFloat { m.height }
+    static var padding: CGFloat { m.gutter }
 }
 
 struct Press: ButtonStyle {
@@ -155,6 +166,7 @@ struct Root: View {
             Footer(audio: audio, theme: theme)
         }
         .frame(width: T.width, height: T.height)
+        .id(theme.density)
         .overlay(alignment: .bottom) {
             if let notice = audio.notice {
                 Text(notice).font(T.mono).padding(.horizontal, 12).padding(.vertical, 7)
@@ -209,33 +221,84 @@ struct TabBar: View {
 struct Footer: View {
     @ObservedObject var audio: AudioState
     @ObservedObject var theme: Theme
+    @State private var showSettings = false
 
     var body: some View {
         HStack(spacing: 10) {
-            Circle().fill(audio.eqMacOn ? T.ok : Color.secondary.opacity(0.3)).frame(width: 5, height: 5)
-            Text("eqMac \(audio.eqMacOn ? "on" : "off")").font(T.mono).foregroundStyle(.tertiary)
+            Text(audio.rackOn ? audio.rackStatus.label : "rack off").font(T.mono).foregroundStyle(.tertiary)
             Spacer()
-            Menu {
-                Section("Accent") {
-                    Picker("Accent", selection: $theme.accent) { ForEach(Theme.Accent.allCases) { Text($0.title).tag($0) } }
-                }
-                Section("Appearance") {
-                    Picker("Appearance", selection: $theme.appearance) { ForEach(Theme.Appearance.allCases) { Text($0.title).tag($0) } }
-                }
-                Section("Capture") {
-                    Picker("Tap", selection: Binding(get: { audio.tapMode }, set: { audio.tapMode = $0 })) {
-                        Text("Stereo mixdown").tag(SystemAudioEngine.TapMode.mixdown)
-                        Text("Device stream (no resample)").tag(SystemAudioEngine.TapMode.deviceStream)
-                    }
-                }
-            } label: {
-                Image(systemName: "gearshape")
-                    .font(.system(size: 11)).foregroundStyle(.secondary).frame(width: 24, height: 22)
+            Button { showSettings.toggle() } label: {
+                Image(systemName: "gearshape").font(.system(size: 11)).foregroundStyle(.secondary).frame(width: 24, height: 22)
             }
-            .menuStyle(.borderlessButton).menuIndicator(.hidden).frame(width: 28)
+            .buttonStyle(Press())
+            .popover(isPresented: $showSettings, arrowEdge: .bottom) { SettingsPopout(audio: audio, theme: theme) }
             Button("Quit") { NSApp.terminate(nil) }.font(.system(size: 11)).foregroundStyle(.tertiary).buttonStyle(.plain)
         }
-        .padding(.horizontal, T.padding).padding(.vertical, 10)
+        .padding(.horizontal, T.padding).padding(.vertical, 9)
+    }
+}
+
+struct SettingsPopout: View {
+    @ObservedObject var audio: AudioState
+    @ObservedObject var theme: Theme
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 14) {
+            Text("Settings").font(.system(size: 13, weight: .semibold))
+
+            SettingGroup("Appearance") {
+                Picker("", selection: $theme.appearance) { ForEach(Theme.Appearance.allCases) { Text($0.title).tag($0) } }
+                    .labelsHidden().pickerStyle(.segmented).controlSize(.small)
+            }
+            SettingGroup("Layout") {
+                Picker("", selection: $theme.density) { ForEach(Theme.Density.allCases) { Text($0.title).tag($0) } }
+                    .labelsHidden().pickerStyle(.segmented).controlSize(.small)
+            }
+            SettingGroup("Accent") {
+                HStack(spacing: 8) {
+                    ForEach(Theme.Accent.allCases) { a in
+                        Button { theme.accent = a } label: {
+                            ZStack {
+                                Circle().fill(a.color).frame(width: 18, height: 18)
+                                if theme.accent == a { Circle().strokeBorder(Color.primary.opacity(0.9), lineWidth: 1.5).frame(width: 24, height: 24) }
+                            }
+                            .frame(width: 24, height: 24)
+                        }
+                        .buttonStyle(Press()).help(a.title)
+                    }
+                }
+            }
+            SettingGroup("Audio capture") {
+                Picker("", selection: Binding(get: { audio.tapMode }, set: { audio.tapMode = $0 })) {
+                    Text("Stereo mixdown").tag(SystemAudioEngine.TapMode.mixdown)
+                    Text("Device stream").tag(SystemAudioEngine.TapMode.deviceStream)
+                }
+                .labelsHidden().pickerStyle(.segmented).controlSize(.small)
+                Text(audio.tapMode == .mixdown
+                     ? "Core Audio mixes every app to stereo, then patchbay resamples to the device rate. Works everywhere."
+                     : "Tap bound to the device's own hardware stream: exact format, no resample. Cleaner on paper; some devices go silent.")
+                    .font(.system(size: 10.5)).foregroundStyle(.tertiary).fixedSize(horizontal: false, vertical: true)
+            }
+            HStack {
+                Text("patchbay · GPLv3").font(T.monoSmall).foregroundStyle(.tertiary)
+                Spacer()
+                Link("GitHub", destination: URL(string: "https://github.com/azain47/patchbay")!).font(.system(size: 11))
+            }
+        }
+        .padding(16)
+        .frame(width: 300)
+    }
+}
+
+struct SettingGroup<Content: View>: View {
+    let title: String
+    let content: Content
+    init(_ title: String, @ViewBuilder content: () -> Content) { self.title = title; self.content = content() }
+    var body: some View {
+        VStack(alignment: .leading, spacing: 6) {
+            Text(title.uppercased()).font(T.section).tracking(1).foregroundStyle(.tertiary)
+            content
+        }
     }
 }
 
@@ -246,7 +309,7 @@ struct FixTab: View {
 
     var body: some View {
         VStack(spacing: 0) {
-            SectionLabel(text: "Recovery").padding(.horizontal, T.padding).padding(.top, 14).padding(.bottom, 6)
+            SectionLabel(text: "Audio recovery").padding(.horizontal, T.padding).padding(.top, 14).padding(.bottom, 6)
             VStack(spacing: 2) {
                 FixRow(icon: "wrench.and.screwdriver.fill", title: "Fix audio", detail: "Reselect a real output and relaunch eqMac if it was routing", kind: .fix, audio: audio) { audio.fixAudio() }
                 FixRow(icon: "arrow.clockwise", title: "Restart eqMac", detail: "Kill and relaunch eqMac, restoring the hardware output first", kind: .restart, audio: audio) { audio.restartEqMac() }
@@ -283,7 +346,7 @@ struct FixRow: View {
                     Circle().fill(Color.primary.opacity(0.08))
                     Image(systemName: icon).font(.system(size: 12, weight: .medium)).foregroundStyle(T.accent)
                 }
-                .frame(width: 28, height: 28)
+                .frame(width: T.m.badge, height: T.m.badge)
                 VStack(alignment: .leading, spacing: 2) {
                     Text(title).font(T.nameStrong)
                     Text(detail).font(.system(size: 10.5)).foregroundStyle(.tertiary)
@@ -295,7 +358,7 @@ struct FixRow: View {
                     Image(systemName: "chevron.right").font(.system(size: 10, weight: .semibold)).foregroundStyle(.quaternary)
                 }
             }
-            .padding(.horizontal, 10).padding(.vertical, 8)
+            .padding(.horizontal, 10).padding(.vertical, T.m.rowV + 1)
             .contentShape(Rectangle())
         }
         .buttonStyle(Press())
@@ -361,7 +424,7 @@ struct DeviceRow: View {
                     Image(systemName: device.icon).font(.system(size: 12, weight: .medium))
                         .foregroundStyle(device.isDefault ? Color.black.opacity(0.8) : Color.primary.opacity(0.7))
                 }
-                .frame(width: 28, height: 28)
+                .frame(width: T.m.badge, height: T.m.badge)
                 VStack(alignment: .leading, spacing: 2) {
                     Text(device.name).font(device.isDefault ? T.nameStrong : T.name).lineLimit(1)
                     Text("\(device.formattedRate)  \(device.transportLabel)").font(T.monoSmall).foregroundStyle(.tertiary)
@@ -370,7 +433,7 @@ struct DeviceRow: View {
                 if isRackTarget { Image(systemName: "waveform").font(.system(size: 11)).foregroundStyle(T.accent) }
                 if device.isDefault { Image(systemName: "checkmark").font(.system(size: 10, weight: .semibold)).foregroundStyle(.secondary) }
             }
-            .padding(.horizontal, 10).padding(.vertical, 7)
+            .padding(.horizontal, 10).padding(.vertical, T.m.rowV)
             .contentShape(Rectangle())
         }
         .buttonStyle(Press())
@@ -428,11 +491,11 @@ struct MeterPair: View {
     var body: some View {
         HStack(spacing: 14) {
             HStack(spacing: 6) {
-                Text("in").font(T.monoSmall).foregroundStyle(.secondary)
+                Text("in").font(T.monoSmall).foregroundStyle(.secondary).frame(width: 16, alignment: .trailing)
                 Meter(level: meters.input).frame(width: 64, height: 3)
             }
             HStack(spacing: 6) {
-                Text("out").font(T.monoSmall).foregroundStyle(.secondary)
+                Text("out").font(T.monoSmall).foregroundStyle(.secondary).frame(width: 20, alignment: .trailing)
                 Meter(level: meters.output).frame(width: 64, height: 3)
             }
         }
@@ -556,12 +619,18 @@ struct RackTab: View {
 
     var body: some View {
         VStack(spacing: 0) {
-            HStack(spacing: 0) {
-                ChainColumn(audio: audio).frame(width: 206)
-                Rectangle().fill(T.hairline).frame(width: 0.5)
-                ModuleEditor(audio: audio).frame(maxWidth: .infinity)
+            if T.m.chain > 0 {
+                HStack(spacing: 0) {
+                    ChainColumn(audio: audio).frame(width: T.m.chain)
+                    Rectangle().fill(T.hairline).frame(width: 0.5)
+                    ModuleEditor(audio: audio).frame(maxWidth: .infinity)
+                }
+                .frame(maxHeight: .infinity)
+            } else {
+                ChainStrip(audio: audio)
+                Rectangle().fill(T.hairline).frame(height: 0.5)
+                ModuleEditor(audio: audio).frame(maxWidth: .infinity, maxHeight: .infinity)
             }
-            .frame(maxHeight: .infinity)
 
             Rectangle().fill(T.hairline).frame(height: 0.5)
 
@@ -577,16 +646,33 @@ struct RackTab: View {
                 .buttonStyle(Press())
                 .animation(T.quick, value: audio.rack.bypass)
                 Spacer()
-                Text(diagnosticsText).font(T.monoSmall).foregroundStyle(.tertiary)
+                Menu {
+                    ForEach(audio.outputRates, id: \.self) { r in
+                        Button { audio.setSampleRate(r) } label: {
+                            HStack { Text(rateLabel(r)); if r == audio.rackTarget?.rate { Image(systemName: "checkmark") } }
+                        }
+                    }
+                } label: {
+                    HStack(spacing: 4) {
+                        Text(rateLabel(audio.rackTarget?.rate ?? 0)).font(T.mono).foregroundStyle(.secondary)
+                        Image(systemName: "chevron.up.chevron.down").font(.system(size: 8, weight: .semibold)).foregroundStyle(.tertiary)
+                    }
+                    .padding(.horizontal, 7).padding(.vertical, 3)
+                    .background(Capsule().fill(T.card))
+                    .overlay(Capsule().strokeBorder(T.hairline, lineWidth: 0.5))
+                }
+                .menuStyle(.borderlessButton).menuIndicator(.hidden).fixedSize()
+                .help("Device sample rate")
+                .disabled(audio.outputRates.count < 2)
+                Text(audio.rackOn ? audio.diagnostics.tapBinding : "").font(T.monoSmall).foregroundStyle(.tertiary)
                 Button("Reset rack") { audio.resetRack() }.font(.system(size: 11)).foregroundStyle(.tertiary).buttonStyle(.plain)
             }
             .padding(.horizontal, T.padding).padding(.vertical, 9)
         }
     }
 
-    private var diagnosticsText: String {
-        guard audio.rackOn, audio.diagnostics.sampleRate > 0 else { return audio.rackTarget?.name ?? "" }
-        return String(format: "%@ · %@ · %.1f kHz", audio.rackTarget?.name ?? "", audio.diagnostics.tapBinding, audio.diagnostics.sampleRate / 1000)
+    private func rateLabel(_ r: Double) -> String {
+        r >= 1000 ? String(format: r.truncatingRemainder(dividingBy: 1000) == 0 ? "%.0f kHz" : "%.1f kHz", r / 1000) : "—"
     }
 }
 
@@ -635,6 +721,77 @@ struct ChainColumn: View {
                 }
             }
         }
+    }
+}
+
+/// Horizontal chain for narrow layouts: chips in signal order, drag to reorder.
+struct ChainStrip: View {
+    @ObservedObject var audio: AudioState
+
+    var body: some View {
+        ScrollView(.horizontal, showsIndicators: false) {
+            HStack(spacing: 6) {
+                ForEach(audio.rack.modules) { m in
+                    ChainChip(module: m, selected: audio.selectedModule == m.id,
+                              select: { audio.selectedModule = m.id },
+                              toggle: { audio.setModuleEnabled(m.id, !m.enabled) })
+                        .draggable(m.id.uuidString)
+                        .dropDestination(for: String.self) { items, _ in
+                            guard let s = items.first, let from = UUID(uuidString: s),
+                                  let fi = audio.rack.modules.firstIndex(where: { $0.id == from }),
+                                  let ti = audio.rack.modules.firstIndex(where: { $0.id == m.id }), fi != ti else { return false }
+                            withAnimation(T.quick) { audio.moveModule(from: IndexSet(integer: fi), to: ti > fi ? ti + 1 : ti) }
+                            return true
+                        }
+                }
+                Menu {
+                    ForEach(["Tone", "Character", "Dynamics", "Space"], id: \.self) { group in
+                        Section(group) {
+                            ForEach(ModuleKind.allCases.filter { $0.group == group }) { kind in
+                                Button { audio.addModule(kind) } label: { Label(kind.title, systemImage: kind.symbol) }
+                            }
+                        }
+                    }
+                } label: {
+                    Image(systemName: "plus").font(.system(size: 11, weight: .semibold)).foregroundStyle(.secondary)
+                        .frame(width: 26, height: 26)
+                        .background(Circle().fill(T.card))
+                        .overlay(Circle().strokeBorder(T.hairline, lineWidth: 0.5))
+                }
+                .menuStyle(.borderlessButton).menuIndicator(.hidden).frame(width: 30)
+            }
+            .padding(.horizontal, T.padding).padding(.vertical, 10)
+            .animation(T.quick, value: audio.rack.modules.map(\.id))
+        }
+    }
+}
+
+struct ChainChip: View {
+    let module: RackModule
+    let selected: Bool
+    let select: () -> Void
+    let toggle: () -> Void
+    @State private var hover = false
+
+    var body: some View {
+        HStack(spacing: 6) {
+            Button(action: toggle) {
+                Circle().fill(module.enabled ? T.accent : Color.primary.opacity(0.18)).frame(width: 6, height: 6)
+                    .frame(width: 12, height: 12).contentShape(Rectangle())
+            }
+            .buttonStyle(.plain)
+            Image(systemName: module.kind.symbol).font(.system(size: 10)).foregroundStyle(selected ? .primary : .secondary)
+            Text(module.title).font(.system(size: 11.5, weight: selected ? .semibold : .medium)).lineLimit(1)
+                .foregroundStyle(module.enabled ? .primary : .secondary)
+        }
+        .padding(.leading, 8).padding(.trailing, 11).padding(.vertical, 5)
+        .background(Capsule().fill(selected ? T.press : (hover ? T.hover : T.card)))
+        .overlay(Capsule().strokeBorder(selected ? T.accent.opacity(0.5) : T.hairline, lineWidth: 0.5))
+        .contentShape(Capsule())
+        .onTapGesture(perform: select)
+        .onHover { hover = $0 }
+        .animation(T.hoverAnim, value: hover)
+        .animation(T.quick, value: selected)
     }
 }
 
@@ -837,7 +994,7 @@ struct BandRow: View {
                 Picker("", selection: Binding(get: { band.type }, set: setType)) {
                     ForEach(FilterType.allCases) { Text($0.rawValue).tag($0) }
                 }
-                .labelsHidden().controlSize(.small).frame(width: 100)
+                .labelsHidden().controlSize(.small).frame(width: 92)
                 Fader(value: band.frequency, range: 20...20_000, log: true, set: setFreq)
                 Text(band.frequency >= 1000 ? String(format: "%.2fk", band.frequency / 1000) : String(format: "%.0f", band.frequency))
                     .font(T.mono).foregroundStyle(.secondary).frame(width: 46, alignment: .trailing)

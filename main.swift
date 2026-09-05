@@ -2,6 +2,7 @@ import Cocoa
 import SwiftUI
 import CoreAudio
 import UniformTypeIdentifiers
+import Combine
 
 // MARK: - Device model
 
@@ -120,6 +121,27 @@ enum CA {
         }
     }
 
+    static func availableRates(_ id: AudioDeviceID) -> [Double] {
+        var a = addr(kAudioDevicePropertyAvailableNominalSampleRates)
+        var size: UInt32 = 0
+        guard AudioObjectGetPropertyDataSize(id, &a, 0, nil, &size) == noErr, size > 0 else { return [] }
+        var ranges = [AudioValueRange](repeating: AudioValueRange(), count: Int(size) / MemoryLayout<AudioValueRange>.size)
+        guard AudioObjectGetPropertyData(id, &a, 0, nil, &size, &ranges) == noErr else { return [] }
+        let common: [Double] = [44_100, 48_000, 88_200, 96_000, 176_400, 192_000]
+        var out = Set<Double>()
+        for r in ranges {
+            if r.mMinimum == r.mMaximum { out.insert(r.mMinimum) } else { common.filter { $0 >= r.mMinimum && $0 <= r.mMaximum }.forEach { out.insert($0) } }
+        }
+        return out.sorted()
+    }
+
+    @discardableResult
+    static func setRate(_ id: AudioDeviceID, _ rate: Double) -> Bool {
+        var a = addr(kAudioDevicePropertyNominalSampleRate)
+        var v = Float64(rate)
+        return AudioObjectSetPropertyData(id, &a, 0, nil, UInt32(MemoryLayout<Float64>.size), &v) == noErr
+    }
+
     static func mute(_ id: AudioDeviceID, input: Bool) -> Bool? {
         let scope = input ? kAudioObjectPropertyScopeInput : kAudioObjectPropertyScopeOutput
         for element: UInt32 in [kAudioObjectPropertyElementMain, 1] {
@@ -198,6 +220,7 @@ final class AudioState: ObservableObject {
     @Published var selectedModule: UUID?
     @Published var inputVolume: Float = 1
     @Published var outputVolume: Float?
+    @Published var outputRates: [Double] = []
     @Published var diagnostics = SystemAudioEngine.Diagnostics()
     @Published var notice: String?
 
@@ -280,6 +303,7 @@ final class AudioState: ObservableObject {
         inputs = CA.devices(input: true)
         if let input = currentInput { inputVolume = CA.volume(input.id, input: true) ?? 1 }
         if let output = currentOutput { outputVolume = CA.volume(output.id, input: false) }
+        outputRates = rackTarget.map { CA.availableRates($0.id) } ?? []
         if let input = currentInput { micMuted = CA.mute(input.id, input: true) ?? (inputVolume == 0 && micVolumeBeforeMute > 0) }
         updateHealth()
         synchronizeRackDevice()
@@ -370,6 +394,14 @@ final class AudioState: ObservableObject {
     }
 
     func setBypass(_ bypass: Bool) { update { $0.bypass = bypass } }
+
+    /// Sets the hardware device's nominal rate. The engine's rate listener rebuilds the
+    /// pipeline (new filter coefficients, line buffers) once Core Audio reports the change.
+    func setSampleRate(_ rate: Double) {
+        guard let target = rackTarget, target.rate != rate else { return }
+        if !CA.setRate(target.id, rate) { notice = "This device refused \(Int(rate)) Hz." }
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.4) { self.refresh() }
+    }
 
     // MARK: Rack editing
 
@@ -568,13 +600,16 @@ final class Bar: NSObject, NSPopoverDelegate {
     private var pop: NSPopover!
     private let audio = AudioState()
     private var monitor: Any?
+    private var appearanceSink: AnyCancellable?
 
     override init() {
         super.init()
         item = NSStatusBar.system.statusItem(withLength: NSStatusItem.variableLength)
         pop = NSPopover()
         pop.contentViewController = NSHostingController(rootView: Root(audio: audio, theme: Theme.shared))
-        Theme.shared.applyAppearance()
+        appearanceSink = Theme.shared.$appearance.sink { [weak self] a in
+            self?.pop.appearance = a == .system ? nil : NSAppearance(named: a == .dark ? .darkAqua : .aqua)
+        }
         pop.behavior = .transient
         pop.animates = true
         pop.delegate = self
