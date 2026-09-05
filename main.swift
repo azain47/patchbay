@@ -344,6 +344,10 @@ final class AudioState: ObservableObject {
         }
         routes = routesStore.routes
         refresh()
+        // A previous instance that died with processing on left the default input on the
+        // virtual mic. This launch either re-attaches (processing persisted on) or hands
+        // the default back; either way nobody stays on a silent device.
+        if !micProcessing { restoreRealMicDefault() }
         refreshProcesses()
         selectedModule = rack.modules.first?.id
         for sel in [kAudioHardwarePropertyDefaultOutputDevice, kAudioHardwarePropertyDefaultInputDevice, kAudioHardwarePropertyDevices] {
@@ -658,7 +662,7 @@ final class AudioState: ObservableObject {
         if defaultInput.map(VirtualMic.isVirtualMic) == true { CA.setDefault(source.id, input: true) }
     }
 
-    /// Called from the app delegate on quit.
+    /// Called from the app delegate on quit and on SIGTERM.
     func prepareForQuit() {
         if micProcessing { micEngine.stop(); restoreRealMicDefault() }
     }
@@ -1062,4 +1066,10 @@ let app = NSApplication.shared
 app.setActivationPolicy(.accessory)
 let del = Delegate()
 app.delegate = del
+// `kill`, Activity Monitor and logout send SIGTERM; route it through terminate so
+// applicationWillTerminate runs and the microphone default is handed back.
+signal(SIGTERM, SIG_IGN)
+let termination = DispatchSource.makeSignalSource(signal: SIGTERM, queue: .main)
+termination.setEventHandler { NSApp.terminate(nil) }
+termination.resume()
 app.run()

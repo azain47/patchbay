@@ -154,8 +154,9 @@ the scope chip (*Microphone*) and is remembered per microphone.
 
 On quit, and whenever the engine cannot run (driver missing, no microphone),
 patchbay hands the default input back to the real microphone, so apps are not
-left listening to a silent device. A crash is the exception. Expect roughly
-10 ms of added latency.
+left listening to a silent device. That covers Quit, logout and SIGTERM; after
+a crash the hand-back happens on the next launch. Expect roughly 10 ms of added
+latency.
 *Remove* in Settings deletes the driver and restarts Core Audio again.
 
 ## License

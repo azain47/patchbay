@@ -17,6 +17,7 @@ mkdir -p "$DRIVER/Contents/MacOS" "$DRIVER/Contents/Resources"
 clang -bundle -O2 \
     -target arm64-apple-macosx14.0 \
     -framework CoreAudio -framework CoreFoundation -framework Accelerate \
+    -Wno-deprecated-declarations \
     -DkDriver_Name='"patchbay Mic"' \
     -DkPlugIn_BundleID='"com.patchbay.mic"' \
     -DkHas_Driver_Name_Format=false \
