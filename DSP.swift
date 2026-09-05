@@ -681,6 +681,11 @@ final class RealtimeDSP {
     private let scope: UnsafeMutablePointer<Float>
     private(set) var scopeWrite = 0
 
+    /// Interleaved stereo copy of a mono input (microphones); sized for the largest IO
+    /// buffer Core Audio hands out.
+    static let monoFrames = 8192
+    private let monoScratch: UnsafeMutablePointer<Float>
+
     init?(settings: RackSettings, sampleRate: Double, generation: UInt64, layoutGeneration: UInt64, proofOnly: Bool) {
         guard let created = PBDSPConfigStoreCreate() else { return nil }
         store = created
@@ -714,6 +719,8 @@ final class RealtimeDSP {
         scratchR = .allocate(capacity: Self.scratchFrames)
         scope = .allocate(capacity: Self.scopeFrames)
         scope.initialize(repeating: 0, count: Self.scopeFrames)
+        monoScratch = .allocate(capacity: Self.monoFrames * 2)
+        monoScratch.initialize(repeating: 0, count: Self.monoFrames * 2)
         publish(settings, generation: generation, layoutGeneration: layoutGeneration)
     }
 
@@ -726,6 +733,7 @@ final class RealtimeDSP {
         scratchL.deallocate()
         scratchR.deallocate()
         scope.deallocate()
+        monoScratch.deallocate()
         PBDSPConfigStoreDestroy(store)
     }
 
@@ -746,24 +754,44 @@ final class RealtimeDSP {
             if b.mNumberChannels == 2, b.mData != nil { break }
             sourceIndex -= 1
         }
+        var monoIndex = -1
+        if sourceIndex < 0 {
+            // No stereo source: accept a mono one (a microphone) and duplicate it to both
+            // channels in scratch so the chain sees the same layout as system audio.
+            monoIndex = inputs.count - 1
+            while monoIndex >= 0 {
+                let b = inputs[monoIndex]
+                if b.mNumberChannels == 1, b.mData != nil { break }
+                monoIndex -= 1
+            }
+        }
         var destinationIndex = 0
         while destinationIndex < outputs.count {
             let b = outputs[destinationIndex]
             if b.mNumberChannels == 2, b.mData != nil { break }
             destinationIndex += 1
         }
-        guard sourceIndex >= 0, destinationIndex < outputs.count,
-              let inputData = inputs[sourceIndex].mData,
+        guard sourceIndex >= 0 || monoIndex >= 0, destinationIndex < outputs.count,
+              let inputData = inputs[max(sourceIndex, monoIndex)].mData,
               let outputData = outputs[destinationIndex].mData else {
             clear(outputs)
             return
         }
 
         renderableLayout = 1
-        let inSamples = inputData.assumingMemoryBound(to: Float.self)
         let outSamples = outputData.assumingMemoryBound(to: Float.self)
         let outBytes = Int(outputs[destinationIndex].mDataByteSize)
-        let frameCount = min(Int(inputs[sourceIndex].mDataByteSize), outBytes) / (2 * MemoryLayout<Float>.size)
+        let inSamples: UnsafeMutablePointer<Float>
+        let frameCount: Int
+        if sourceIndex >= 0 {
+            inSamples = inputData.assumingMemoryBound(to: Float.self)
+            frameCount = min(Int(inputs[sourceIndex].mDataByteSize), outBytes) / (2 * MemoryLayout<Float>.size)
+        } else {
+            let mono = inputData.assumingMemoryBound(to: Float.self)
+            frameCount = min(Int(inputs[monoIndex].mDataByteSize) / MemoryLayout<Float>.size, outBytes / (2 * MemoryLayout<Float>.size), Self.monoFrames)
+            for i in 0..<frameCount { monoScratch[i * 2] = mono[i]; monoScratch[i * 2 + 1] = mono[i] }
+            inSamples = monoScratch
+        }
 
         var peakIn: Float = 0
         for i in 0..<(frameCount * 2) { peakIn = max(peakIn, abs(inSamples[i])) }

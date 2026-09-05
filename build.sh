@@ -34,6 +34,7 @@ swiftc \
     "$DIR/UI.swift" \
     "$DIR/AutoEQ.swift" \
     "$DIR/Routing.swift" \
+    "$DIR/MicEngine.swift" \
     "$OBJ"
 
 cat > "$APP/Contents/Info.plist" << 'EOF'
@@ -61,10 +62,15 @@ cat > "$APP/Contents/Info.plist" << 'EOF'
     <true/>
     <key>NSAudioCaptureUsageDescription</key>
     <string>patchbay needs access to process system audio through your effects rack.</string>
+    <key>NSMicrophoneUsageDescription</key>
+    <string>patchbay reads your microphone to run it through the microphone chain into patchbay Mic.</string>
 </dict>
 </plist>
 EOF
 
-codesign -s - --force "$APP" 2>/dev/null
+mkdir -p "$APP/Contents/Resources"
+bash "$DIR/VirtualMic/build.sh" "$APP/Contents/Resources" 2>&1 | grep -E "error|built" || true
+
+codesign -s - --force --deep "$APP" 2>/dev/null
 
 echo "built $APP"

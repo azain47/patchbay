@@ -281,9 +281,21 @@ final class AudioState: ObservableObject {
     @Published var selectedModule: UUID?
 
     // Routing: which app goes where. `rack` always holds the chain being edited; `rackScope`
-    // says whether that is the system chain or one route's chain.
-    enum RackScope: Equatable { case system, route(UUID) }
+    // says whether that is the system chain, one route's chain, or the microphone chain.
+    enum RackScope: Equatable { case system, route(UUID), input }
     @Published var rackScope: RackScope = .system
+
+    // Microphone: real mic → chain → "patchbay Mic" virtual device, opt-in driver install.
+    @Published var virtualMicInstalled = VirtualMic.installed
+    @Published var virtualMicPresent = false
+    @Published var micProcessing = UserDefaults.standard.bool(forKey: "micProcessing")
+    @Published var micStatus: SystemAudioEngine.Status = .stopped
+    @Published var micBusy = false
+    private let micEngine = MicEngine()
+    /// The real microphone feeding the chain. Remembered separately because the default
+    /// input becomes the virtual mic while processing is on.
+    private var micSourceUID: String? = UserDefaults.standard.string(forKey: "micSourceUID")
+    var micSource: Device? { inputs.first { $0.uid == micSourceUID } ?? inputs.first { $0.isDefault } ?? inputs.first }
     @Published var routes: [Route] = []
     @Published var routeStatus: [UUID: SystemAudioEngine.Status] = [:]
     @Published var audioApps: [AudioApp] = []
@@ -325,6 +337,11 @@ final class AudioState: ObservableObject {
             guard let self, self.rackOn, let target = self.rackTarget else { return }
             self.engine.start(output: target, settings: self.systemRack)
         }
+        micEngine.onStatus = { [weak self] status in self?.micStatus = status }
+        micEngine.onNeedsRestart = { [weak self] in
+            guard let self, self.micProcessing, let source = self.micSource else { return }
+            self.micEngine.start(source: source, settings: self.micRack)
+        }
         routes = routesStore.routes
         refresh()
         refreshProcesses()
@@ -355,17 +372,19 @@ final class AudioState: ObservableObject {
         }
     }
 
-    /// The engine whose chain is currently being edited: the system engine or a route's.
-    private var scopedEngine: SystemAudioEngine? {
+    /// The engine whose chain is currently being edited.
+    private var scopedEngine: LiveEngine? {
         switch rackScope {
         case .system: engine
         case .route(let id): routeEngines[id]
+        case .input: micEngine
         }
     }
     private var scopedOn: Bool {
         switch rackScope {
         case .system: rackOn
         case .route(let id): routes.first { $0.id == id }?.enabled ?? false
+        case .input: micProcessing
         }
     }
     /// The system chain regardless of what the rack page is editing. `rack` is only the
@@ -376,6 +395,7 @@ final class AudioState: ObservableObject {
         stored.enabled = rackOn
         return stored
     }
+    private var micRackKey: String? { micSource.map { "input:\($0.uid)" } }
 
     /// Meters only tick while the popover is visible.
     func setVisible(_ visible: Bool) {
@@ -404,15 +424,21 @@ final class AudioState: ObservableObject {
     // MARK: Devices
 
     func refresh() {
-        outputs = CA.devices(input: false)
-        inputs = CA.devices(input: true)
-        if let input = currentInput { inputVolume = CA.volume(input.id, input: true) ?? 1 }
+        // The virtual mic has an output stream too; it is never an output for the user and
+        // never a source for the chain, so it is kept out of both lists.
+        let all = CA.devices(input: false) + CA.devices(input: true)
+        virtualMicPresent = all.contains(where: VirtualMic.isVirtualMic)
+        virtualMicInstalled = VirtualMic.installed
+        outputs = CA.devices(input: false).filter { !VirtualMic.isVirtualMic($0) }
+        inputs = CA.devices(input: true).filter { !VirtualMic.isVirtualMic($0) }
+        if let input = micSource { inputVolume = CA.volume(input.id, input: true) ?? 1 }
         if let output = currentOutput { outputVolume = CA.volume(output.id, input: false) }
         outputRates = rackTarget.map { CA.availableRates($0.id) } ?? []
-        if let input = currentInput { micMuted = CA.mute(input.id, input: true) ?? (inputVolume == 0 && micVolumeBeforeMute > 0) }
+        if let input = micSource { micMuted = CA.mute(input.id, input: true) ?? (inputVolume == 0 && micVolumeBeforeMute > 0) }
         updateHealth()
         synchronizeRackDevice()
         synchronizeRoutes()
+        synchronizeMic()
     }
 
     /// pgrep on a background queue; the main thread never blocks on a process spawn.
@@ -431,7 +457,7 @@ final class AudioState: ObservableObject {
     }
 
     func setMicMuted(_ muted: Bool) {
-        guard let input = currentInput else { return }
+        guard let input = micSource else { return }
         micMuted = muted
         if CA.setMute(input.id, input: true, muted) { return }
         // Device has no mute control: emulate with the gain slider.
@@ -571,6 +597,10 @@ final class AudioState: ObservableObject {
             var loaded = route.rack
             loaded.enabled = route.enabled
             rack = loaded
+        case .input:
+            var loaded = micRackKey.map { rackStore.settings(for: $0) } ?? RackSettings(modules: [])
+            loaded.enabled = micProcessing
+            rack = loaded
         }
         selectedModule = rack.modules.first?.id
     }
@@ -583,12 +613,14 @@ final class AudioState: ObservableObject {
         switch headerScope {
         case .system: rackOn
         case .route(let id): routes.first { $0.id == id }?.enabled ?? false
+        case .input: micProcessing
         }
     }
     var scopeStatus: SystemAudioEngine.Status {
         switch headerScope {
         case .system: rackStatus
         case .route(let id): routeStatus[id] ?? .stopped
+        case .input: micStatus
         }
     }
     /// Bypass state of whatever the header refers to.
@@ -597,15 +629,100 @@ final class AudioState: ObservableObject {
         switch headerScope {
         case .system: setRackOn(on)
         case .route(let id): setRoute(id, enabled: on)
+        case .input: setMicProcessing(on)
         }
     }
 
-    func select(_ device: Device) {
-        if device.isInput {
-            CA.setDefault(device.id, input: true)
-            DispatchQueue.main.asyncAfter(deadline: .now() + 0.2) { self.refresh() }
+    // MARK: Microphone
+
+    /// Keeps the mic engine matched to the chosen source while processing is on.
+    private func synchronizeMic() {
+        guard micProcessing else { micEngine.stop(); return }
+        guard virtualMicPresent else {
+            micEngine.stop()
+            micStatus = .failed(virtualMicInstalled ? "patchbay Mic is not available yet." : "patchbay Mic is not installed.")
             return
         }
+        guard let source = micSource else { micEngine.stop(); micStatus = .failed("No microphone is available."); return }
+        guard micEngine.sourceUID != source.uid else { return }
+        micEngine.start(source: source, settings: micRack)
+    }
+
+    private var micRack: RackSettings {
+        if rackScope == .input { return rack }
+        var stored = micRackKey.map { rackStore.settings(for: $0) } ?? RackSettings(modules: [])
+        stored.enabled = micProcessing
+        return stored
+    }
+
+    /// Turns the processed microphone on or off. While on, "patchbay Mic" is the default
+    /// input so apps pick it up; turning off hands the default back to the real mic.
+    func setMicProcessing(_ on: Bool) {
+        guard on != micProcessing else { return }
+        if on {
+            guard virtualMicPresent, let source = micSource else { notice = "Install patchbay Mic first."; return }
+            micSourceUID = source.uid
+            UserDefaults.standard.set(source.uid, forKey: "micSourceUID")
+            micProcessing = true
+            UserDefaults.standard.set(true, forKey: "micProcessing")
+            if rackScope == .input { rack.enabled = true }
+            micEngine.start(source: source, settings: micRack)
+            if let virtual = CA.devices(input: true).first(where: VirtualMic.isVirtualMic) { CA.setDefault(virtual.id, input: true) }
+        } else {
+            micProcessing = false
+            UserDefaults.standard.set(false, forKey: "micProcessing")
+            if rackScope == .input { rack.enabled = false }
+            micEngine.stop()
+            micStatus = .stopped
+            if let source = micSource { CA.setDefault(source.id, input: true) }
+        }
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.3) { self.refresh() }
+    }
+
+    /// Picks which real microphone feeds the chain (and becomes the default input when
+    /// processing is off).
+    func setMicSource(_ device: Device) {
+        micSourceUID = device.uid
+        UserDefaults.standard.set(device.uid, forKey: "micSourceUID")
+        if !micProcessing { CA.setDefault(device.id, input: true) }
+        if rackScope == .input { setRackScope(.system); setRackScope(.input) }
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.2) { self.refresh() }
+    }
+
+    /// Installing or removing the driver restarts coreaudiod, which invalidates every tap,
+    /// aggregate and IO proc. Everything is stopped first and rebuilt once the HAL is back.
+    func installVirtualMic() { changeDriver(install: true) }
+    func uninstallVirtualMic() { changeDriver(install: false) }
+
+    private func changeDriver(install: Bool) {
+        guard !micBusy else { return }
+        micBusy = true
+        if !install, micProcessing { setMicProcessing(false) }
+        quiesceEngines()
+        let done: (Result<Void, Error>) -> Void = { [weak self] result in
+            guard let self else { return }
+            if case .failure(let error) = result, (error as? VirtualMic.Failure)?.message != "Cancelled." {
+                self.notice = error.localizedDescription
+            }
+            // coreaudiod needs a moment to come back and enumerate the driver.
+            DispatchQueue.main.asyncAfter(deadline: .now() + 3) {
+                self.micBusy = false
+                self.refresh()
+                self.refreshProcesses()
+                if install, self.virtualMicPresent { self.notice = "patchbay Mic installed." }
+            }
+        }
+        install ? VirtualMic.install(completion: done) : VirtualMic.uninstall(completion: done)
+    }
+
+    private func quiesceEngines() {
+        engine.stop()
+        for route in routeEngines.values { route.stop() }
+        micEngine.stop()
+    }
+
+    func select(_ device: Device) {
+        if device.isInput { setMicSource(device); return }
         if rackOn && device.isEqMac { setRackOn(false) }
         engine.stop()
         CA.setDefault(device.id, input: false)
@@ -617,7 +734,7 @@ final class AudioState: ObservableObject {
 
     func setInputVolume(_ value: Float) {
         inputVolume = value
-        if let input = currentInput { CA.setVolume(input.id, input: true, value) }
+        if let input = micSource { CA.setVolume(input.id, input: true, value) }
     }
 
     func setOutputVolume(_ value: Float) {
@@ -790,6 +907,9 @@ final class AudioState: ObservableObject {
             guard let i = routes.firstIndex(where: { $0.id == id }) else { return }
             routes[i].rack = rack
             routesStore.save(routes)
+        case .input:
+            guard let key = micRackKey else { return }
+            rackStore.save(rack, for: key)
         }
     }
 

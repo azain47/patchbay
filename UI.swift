@@ -342,6 +342,15 @@ struct SettingsPopout: View {
                      : "Tap bound to the device's own hardware stream: exact format, no resample. Cleaner on paper; some devices go silent.")
                     .font(.system(size: 10.5)).foregroundStyle(.tertiary).fixedSize(horizontal: false, vertical: true)
             }
+            if audio.virtualMicInstalled {
+                SettingGroup("Virtual microphone") {
+                    HStack {
+                        Text("patchbay Mic is installed in /Library/Audio/Plug-Ins/HAL.").font(.system(size: 10.5)).foregroundStyle(.tertiary)
+                        Spacer()
+                        Button("Remove") { audio.uninstallVirtualMic() }.font(.system(size: 11)).controlSize(.small).disabled(audio.micBusy)
+                    }
+                }
+            }
             HStack {
                 Text("patchbay · GPLv3").font(m.monoSmall).foregroundStyle(.tertiary)
                 Spacer()
@@ -466,19 +475,100 @@ struct InputTab: View {
         VStack(spacing: 0) {
             SectionLabel(text: "Input devices").padding(.horizontal, m.gutter).padding(.top, m.sectionTop).padding(.bottom, m.sectionTop / 2)
             VStack(spacing: m.rowGap) {
-                ForEach(audio.inputs) { d in DeviceRow(device: d, isRackTarget: false) { audio.select(d) } }
+                ForEach(audio.inputs) { d in
+                    DeviceRow(device: d, isRackTarget: audio.micProcessing && audio.micSource?.id == d.id, isDefault: audio.micSource?.id == d.id) { audio.select(d) }
+                }
             }
             .padding(.horizontal, 10)
             LevelRow(icon: "mic", value: Double(audio.inputVolume), muted: audio.micMuted, toggleMute: { audio.setMicMuted(!audio.micMuted) }) { audio.setInputVolume(Float($0)) }
                 .padding(.top, m.sectionTop - 2)
-            if m.subtitle {
-                Text("Effects on the microphone need a virtual input device, which patchbay does not install. Gain and mute are hardware controls.")
-                    .font(.system(size: m.monoSize)).foregroundStyle(.tertiary).fixedSize(horizontal: false, vertical: true)
-                    .padding(.horizontal, m.gutter).padding(.top, m.sectionTop)
-            }
+
+            SectionLabel(text: "Microphone chain").padding(.horizontal, m.gutter).padding(.top, m.sectionTop + 4).padding(.bottom, m.sectionTop / 2)
+            MicSection(audio: audio).padding(.horizontal, 10)
             Color.clear.frame(height: m.sectionTop)
         }
         .frame(maxWidth: .infinity, alignment: .top)
+    }
+}
+
+/// Opt-in processed microphone. Without the driver: what it is and an install button.
+/// With it: on/off, live status, and a way into the chain editor.
+struct MicSection: View {
+    @Environment(\.metrics) private var m
+    @ObservedObject var audio: AudioState
+
+    var body: some View {
+        if audio.virtualMicInstalled {
+            HStack(spacing: 10) {
+                Button { audio.setMicProcessing(!audio.micProcessing) } label: {
+                    Circle().fill(dot).frame(width: 7, height: 7).frame(width: 14, height: 14).contentShape(Rectangle())
+                }
+                .buttonStyle(.plain).disabled(audio.micBusy)
+                ZStack {
+                    Circle().fill(audio.micProcessing ? T.accent.opacity(0.9) : Color.primary.opacity(0.08))
+                    Image(systemName: "waveform.and.mic").font(.system(size: 11, weight: .medium))
+                        .foregroundStyle(audio.micProcessing ? Color.black.opacity(0.8) : Color.primary.opacity(0.7))
+                }
+                .frame(width: m.badge, height: m.badge)
+                VStack(alignment: .leading, spacing: 2) {
+                    Text("patchbay Mic").font(m.nameStrong)
+                    Text(statusText).font(m.monoSmall).foregroundStyle(.tertiary).lineLimit(1)
+                }
+                Spacer()
+                Toggle("", isOn: Binding(get: { audio.micProcessing }, set: { audio.setMicProcessing($0) }))
+                    .labelsHidden().toggleStyle(.switch).controlSize(.small).tint(T.accent)
+                    .disabled(audio.micBusy || !audio.virtualMicPresent)
+                IconButton("slider.horizontal.3", active: audio.rackScope == .input) {
+                    audio.setRackScope(.input)
+                    audio.tab = .rack
+                }
+                .help("Edit the microphone chain")
+            }
+            .padding(.horizontal, 10).padding(.vertical, m.rowV + 1)
+            .hoverRow()
+            if m.subtitle {
+                Text("While on, apps see “patchbay Mic” as the default microphone and receive the processed signal. Turning it off hands the default back to \(audio.micSource?.name ?? "the real microphone").")
+                    .font(.system(size: m.monoSize)).foregroundStyle(.tertiary).fixedSize(horizontal: false, vertical: true)
+                    .padding(.horizontal, m.gutter - 4).padding(.top, 6)
+            }
+        } else {
+            VStack(alignment: .leading, spacing: 8) {
+                Text("Effects on the microphone need a virtual input device. patchbay can install one: a 90 KB passthrough driver (BlackHole, GPLv3) that appears as “patchbay Mic”. Needs your password once and restarts Core Audio for about three seconds.")
+                    .font(.system(size: m.monoSize + 0.5)).foregroundStyle(.secondary).fixedSize(horizontal: false, vertical: true)
+                HStack {
+                    Spacer()
+                    Button { audio.installVirtualMic() } label: {
+                        HStack(spacing: 6) {
+                            if audio.micBusy { ProgressView().controlSize(.small).scaleEffect(0.6).frame(width: 12, height: 12) }
+                            Text(audio.micBusy ? "Installing…" : "Install patchbay Mic").font(.system(size: 11.5, weight: .medium))
+                        }
+                        .foregroundStyle(Color.black.opacity(0.85))
+                        .padding(.horizontal, 12).padding(.vertical, 5)
+                        .background(Capsule().fill(T.accent))
+                    }
+                    .buttonStyle(Press()).disabled(audio.micBusy)
+                }
+            }
+            .padding(12)
+            .background(RoundedRectangle(cornerRadius: 9).fill(T.card))
+            .overlay(RoundedRectangle(cornerRadius: 9).strokeBorder(T.hairline, lineWidth: 0.5))
+        }
+    }
+
+    private var statusText: String {
+        if audio.micBusy { return "restarting Core Audio…" }
+        if !audio.virtualMicPresent { return "driver installed, device not up yet" }
+        return audio.micProcessing ? audio.micStatus.label : "off"
+    }
+
+    private var dot: Color {
+        guard audio.micProcessing else { return Color.primary.opacity(0.18) }
+        switch audio.micStatus {
+        case .running: return T.ok
+        case .proving, .waiting: return T.accent
+        case .failed: return T.warn
+        case .stopped: return Color.primary.opacity(0.18)
+        }
     }
 }
 
@@ -611,29 +701,33 @@ struct DeviceRow: View {
     @Environment(\.metrics) private var m
     let device: Device
     let isRackTarget: Bool
+    /// Which row is checked. Defaults to macOS's default device; the input list passes
+    /// the chain's source instead, since the default becomes the virtual mic while on.
+    var isDefault: Bool? = nil
     let action: () -> Void
 
     var body: some View {
+        let selected = isDefault ?? device.isDefault
         Button(action: action) {
             HStack(spacing: 12) {
                 ZStack {
-                    Circle().fill(device.isDefault ? T.accent.opacity(0.9) : Color.primary.opacity(0.08))
+                    Circle().fill(selected ? T.accent.opacity(0.9) : Color.primary.opacity(0.08))
                     Image(systemName: device.icon).font(.system(size: 12, weight: .medium))
-                        .foregroundStyle(device.isDefault ? Color.black.opacity(0.8) : Color.primary.opacity(0.7))
+                        .foregroundStyle(selected ? Color.black.opacity(0.8) : Color.primary.opacity(0.7))
                 }
                 .frame(width: m.badge, height: m.badge)
                 if m.subtitle {
                     VStack(alignment: .leading, spacing: 2) {
-                        Text(device.name).font(device.isDefault ? m.nameStrong : m.name).lineLimit(1)
+                        Text(device.name).font(selected ? m.nameStrong : m.name).lineLimit(1)
                         Text("\(device.formattedRate)  \(device.transportLabel)").font(m.monoSmall).foregroundStyle(.tertiary)
                     }
                 } else {
-                    Text(device.name).font(device.isDefault ? m.nameStrong : m.name).lineLimit(1)
+                    Text(device.name).font(selected ? m.nameStrong : m.name).lineLimit(1)
                 }
                 Spacer()
                 if !m.subtitle { Text(device.formattedRate).font(m.monoSmall).foregroundStyle(.tertiary) }
                 if isRackTarget { Image(systemName: "waveform").font(.system(size: 11)).foregroundStyle(T.accent) }
-                if device.isDefault { Image(systemName: "checkmark").font(.system(size: 10, weight: .semibold)).foregroundStyle(.secondary) }
+                if selected { Image(systemName: "checkmark").font(.system(size: 10, weight: .semibold)).foregroundStyle(.secondary) }
             }
             .padding(.horizontal, 10).padding(.vertical, m.rowV)
             .contentShape(Rectangle())
@@ -899,17 +993,23 @@ struct ChainStrip: View {
         switch audio.rackScope {
         case .system: "System"
         case .route(let id): audio.routes.first { $0.id == id }?.name ?? "Route"
+        case .input: "Microphone"
         }
     }
 
     var body: some View {
         HStack(spacing: 6) {
-            if !audio.routes.isEmpty {
+            if !audio.routes.isEmpty || audio.virtualMicInstalled {
                 Menu {
                     Button { audio.setRackScope(.system) } label: {
                         HStack { Text("System"); if audio.rackScope == .system { Image(systemName: "checkmark") } }
                     }
-                    Divider()
+                    if audio.virtualMicInstalled {
+                        Button { audio.setRackScope(.input) } label: {
+                            HStack { Text("Microphone"); if audio.rackScope == .input { Image(systemName: "checkmark") } }
+                        }
+                    }
+                    if !audio.routes.isEmpty { Divider() }
                     ForEach(audio.routes) { route in
                         Button { audio.setRackScope(.route(route.id)) } label: {
                             HStack { Text(route.name); if audio.rackScope == .route(route.id) { Image(systemName: "checkmark") } }
@@ -917,7 +1017,7 @@ struct ChainStrip: View {
                     }
                 } label: {
                     HStack(spacing: 5) {
-                        Image(systemName: audio.rackScope == .system ? "macwindow.on.rectangle" : "arrow.triangle.branch").font(.system(size: 10))
+                        Image(systemName: audio.rackScope == .system ? "macwindow.on.rectangle" : audio.rackScope == .input ? "mic" : "arrow.triangle.branch").font(.system(size: 10))
                         Text(scopeName).font(.system(size: 11.5, weight: .semibold)).lineLimit(1)
                         Image(systemName: "chevron.up.chevron.down").font(.system(size: 8, weight: .semibold)).foregroundStyle(.tertiary)
                     }
@@ -961,7 +1061,7 @@ struct ChainStrip: View {
                 }
                 .menuStyle(.borderlessButton).menuIndicator(.hidden).frame(width: 30)
                 }
-                .padding(.leading, audio.routes.isEmpty ? m.gutter : 4).padding(.trailing, m.gutter)
+                .padding(.leading, (audio.routes.isEmpty && !audio.virtualMicInstalled) ? m.gutter : 4).padding(.trailing, m.gutter)
                 .animation(T.quick, value: audio.rack.modules.map(\.id))
             }
         }

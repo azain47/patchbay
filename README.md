@@ -1,6 +1,6 @@
 # patchbay
 
-A native, open-source DSP rack and per-app router for macOS system audio. No virtual audio driver.
+A native, open-source DSP rack and per-app router for macOS system audio. No virtual audio driver for output; an optional one for the microphone.
 
 <p align="center">
   <img src="screenshot.png" width="426" alt="patchbay devices page">
@@ -106,9 +106,10 @@ resampled; cleaner on paper, but some devices deliver silence, so it is opt-in.
 ## Limits
 
 - **Input effects need a virtual device.** Process taps only intercept output.
-  Applying the chain to a microphone so other apps receive it requires an
-  AudioServerPlugIn driver, which is exactly what patchbay avoids. Input device
-  selection and gain are supported; input processing is not.
+  Putting the chain on a microphone so other apps receive it needs something
+  that looks like an input device, which is why the microphone chain is the one
+  opt-in that installs a driver (see *Microphone* below). Without it, input
+  device selection, gain and mute still work.
 - **One tap processor at a time.** Running patchbay alongside another
   `mutedWhenTapped`-based app (FineTune, CoreEQ) chains two muting processors
   on one device; results range from double latency to silence.
@@ -128,6 +129,32 @@ On first rack enable, macOS asks for System Audio Recording permission.
 The rack is deliberately off at launch: patchbay never seizes system audio
 without being asked.
 
+## Microphone
+
+The one feature that touches the system. Input → *Microphone chain* → *Install
+patchbay Mic* copies a 90 KB passthrough loopback driver into
+`/Library/Audio/Plug-Ins/HAL/patchbayMic.driver` (asks for an administrator
+password, restarts Core Audio for about three seconds). The driver is
+[BlackHole](https://github.com/ExistentialAudio/BlackHole) (GPLv3, Existential
+Audio) built as a single 2-channel device named "patchbay Mic"; the source and
+build script are in `VirtualMic/`. It has no logic of its own: whatever is
+written to its output stream appears on its input stream.
+
+```text
+real microphone → [ microphone chain ] → patchbay Mic → Zoom, Discord, OBS…
+```
+
+With the driver installed, the switch on the Input page runs the chain from the
+selected real microphone into patchbay Mic and makes patchbay Mic the default
+input, so apps pick it up without configuration. Turning it off hands the
+default input back to the real microphone. The chain is edited in the rack via
+the scope chip (*Microphone*) and is remembered per microphone.
+
+Honest limits: if patchbay quits while processing is on, apps that selected
+patchbay Mic hear silence until they pick the real microphone again or patchbay
+is relaunched (it re-attaches on launch). Expect roughly 10 ms of added latency.
+*Remove* in Settings deletes the driver and restarts Core Audio again.
+
 ## License
 
-[GPLv3](LICENSE). AutoEq data is MIT-licensed by Jaakko Pasanen and contributors.
+[GPLv3](LICENSE). AutoEq data is MIT-licensed by Jaakko Pasanen and contributors. The virtual microphone driver is BlackHole, GPLv3 © Existential Audio Inc. (`VirtualMic/LICENSE`).
