@@ -1,7 +1,10 @@
 #!/bin/bash
-# Builds patchbayMic.driver: BlackHole (GPLv3, Existential Audio) compiled as a single
-# 2-channel loopback device named "patchbay Mic". Whatever patchbay writes to its output
-# stream appears on its input stream, so any app can pick "patchbay Mic" as a microphone.
+# Builds patchbayMic.driver: BlackHole (GPLv3, Existential Audio) compiled as two devices
+# sharing one ring buffer:
+#   "patchbay Mic"       visible, input-only  — what Zoom/Discord/OBS select as microphone
+#   "patchbay Mic Sink"  hidden,  output-only — what patchbay's mic engine writes into
+# Splitting them keeps the mic's own input stream out of patchbay's aggregate, so the
+# engine can never read back what it just wrote.
 set -euo pipefail
 DIR="$(cd "$(dirname "$0")" && pwd)"
 OUT="${1:-$DIR/../patchbay.app/Contents/Resources}"
@@ -18,14 +21,18 @@ clang -bundle -O2 \
     -DkPlugIn_BundleID='"com.patchbay.mic"' \
     -DkHas_Driver_Name_Format=false \
     -DkDevice_Name='"patchbay Mic"' \
-    -DkDevice2_Name='"patchbay Mic Mirror"' \
+    -DkDevice_HasInput=true \
+    -DkDevice_HasOutput=false \
+    -DkDevice_IsHidden=false \
+    -DkDevice2_Name='"patchbay Mic Sink"' \
+    -DkDevice2_HasInput=false \
+    -DkDevice2_HasOutput=true \
     -DkDevice2_IsHidden=true \
     -DkManufacturer_Name='"patchbay"' \
     -DkNumber_Of_Channels=2 \
     -DkSampleRates='44100, 48000, 96000' \
     -DkCanBeDefaultSystemDevice=false \
     -DkPlugIn_Icon='"patchbayMic.icns"' \
-    -Wno-deprecated-declarations \
     -o "$DRIVER/Contents/MacOS/patchbayMic" \
     "$DIR/BlackHole.c"
 

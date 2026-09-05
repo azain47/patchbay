@@ -342,12 +342,19 @@ struct SettingsPopout: View {
                      : "Tap bound to the device's own hardware stream: exact format, no resample. Cleaner on paper; some devices go silent.")
                     .font(.system(size: 10.5)).foregroundStyle(.tertiary).fixedSize(horizontal: false, vertical: true)
             }
-            if audio.virtualMicInstalled {
-                SettingGroup("Virtual microphone") {
-                    HStack {
-                        Text("patchbay Mic is installed in /Library/Audio/Plug-Ins/HAL.").font(.system(size: 10.5)).foregroundStyle(.tertiary)
-                        Spacer()
-                        Button("Remove") { audio.uninstallVirtualMic() }.font(.system(size: 11)).controlSize(.small).disabled(audio.micBusy)
+            SettingGroup("Virtual microphone") {
+                HStack(alignment: .firstTextBaseline) {
+                    Text(audio.virtualMicInstalled
+                         ? "patchbay Mic is installed in /Library/Audio/Plug-Ins/HAL."
+                         : "Mic effects need a loopback driver (BlackHole, 90 KB). Admin password; Core Audio restarts for ~3 s.")
+                        .font(.system(size: 10.5)).foregroundStyle(.tertiary).fixedSize(horizontal: false, vertical: true)
+                    Spacer()
+                    if audio.micBusy {
+                        ProgressView().controlSize(.small).scaleEffect(0.6).frame(width: 12, height: 12)
+                    } else if audio.virtualMicInstalled {
+                        Button("Remove") { audio.uninstallVirtualMic() }.font(.system(size: 11)).controlSize(.small)
+                    } else {
+                        Button("Install") { audio.installVirtualMic() }.font(.system(size: 11)).controlSize(.small)
                     }
                 }
             }
@@ -483,22 +490,24 @@ struct InputTab: View {
             LevelRow(icon: "mic", value: Double(audio.inputVolume), muted: audio.micMuted, toggleMute: { audio.setMicMuted(!audio.micMuted) }) { audio.setInputVolume(Float($0)) }
                 .padding(.top, m.sectionTop - 2)
 
-            SectionLabel(text: "Microphone chain").padding(.horizontal, m.gutter).padding(.top, m.sectionTop + 4).padding(.bottom, m.sectionTop / 2)
-            MicSection(audio: audio).padding(.horizontal, 10)
+            if audio.virtualMicInstalled {
+                SectionLabel(text: "Microphone chain").padding(.horizontal, m.gutter).padding(.top, m.sectionTop + 4).padding(.bottom, m.sectionTop / 2)
+                MicSection(audio: audio).padding(.horizontal, 10)
+            }
             Color.clear.frame(height: m.sectionTop)
         }
         .frame(maxWidth: .infinity, alignment: .top)
     }
 }
 
-/// Opt-in processed microphone. Without the driver: what it is and an install button.
-/// With it: on/off, live status, and a way into the chain editor.
+/// Processed microphone row, shown once the patchbay Mic driver is installed (Settings →
+/// Virtual microphone): on/off, live status, and a way into the chain editor.
 struct MicSection: View {
     @Environment(\.metrics) private var m
     @ObservedObject var audio: AudioState
 
     var body: some View {
-        if audio.virtualMicInstalled {
+        Group {
             HStack(spacing: 10) {
                 Button { audio.setMicProcessing(!audio.micProcessing) } label: {
                     Circle().fill(dot).frame(width: 7, height: 7).frame(width: 14, height: 14).contentShape(Rectangle())
@@ -531,27 +540,6 @@ struct MicSection: View {
                     .font(.system(size: m.monoSize)).foregroundStyle(.tertiary).fixedSize(horizontal: false, vertical: true)
                     .padding(.horizontal, m.gutter - 4).padding(.top, 6)
             }
-        } else {
-            VStack(alignment: .leading, spacing: 8) {
-                Text("Effects on the microphone need a virtual input device. patchbay can install one: a 90 KB passthrough driver (BlackHole, GPLv3) that appears as “patchbay Mic”. Needs your password once and restarts Core Audio for about three seconds.")
-                    .font(.system(size: m.monoSize + 0.5)).foregroundStyle(.secondary).fixedSize(horizontal: false, vertical: true)
-                HStack {
-                    Spacer()
-                    Button { audio.installVirtualMic() } label: {
-                        HStack(spacing: 6) {
-                            if audio.micBusy { ProgressView().controlSize(.small).scaleEffect(0.6).frame(width: 12, height: 12) }
-                            Text(audio.micBusy ? "Installing…" : "Install patchbay Mic").font(.system(size: 11.5, weight: .medium))
-                        }
-                        .foregroundStyle(Color.black.opacity(0.85))
-                        .padding(.horizontal, 12).padding(.vertical, 5)
-                        .background(Capsule().fill(T.accent))
-                    }
-                    .buttonStyle(Press()).disabled(audio.micBusy)
-                }
-            }
-            .padding(12)
-            .background(RoundedRectangle(cornerRadius: 9).fill(T.card))
-            .overlay(RoundedRectangle(cornerRadius: 9).strokeBorder(T.hairline, lineWidth: 0.5))
         }
     }
 

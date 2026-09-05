@@ -22,12 +22,17 @@ extension MicEngine: LiveEngine {}
 /// patchbay writes to its output stream appears on its input stream, so any app can
 /// select "patchbay Mic" as its microphone and receive the processed signal.
 enum VirtualMic {
+    /// Visible input-only device apps select as their microphone.
     static let deviceUID = "patchbay Mic_UID"
+    /// Hidden output-only twin sharing the ring buffer; the engine writes here. Keeping the
+    /// mic's own input stream out of the aggregate means the engine can never read back
+    /// what it just wrote.
+    static let sinkUID = "patchbay Mic_2_UID"
     static let installPath = "/Library/Audio/Plug-Ins/HAL/patchbayMic.driver"
     static var bundledPath: String? { Bundle.main.path(forResource: "patchbayMic", ofType: "driver") }
 
     static var installed: Bool { FileManager.default.fileExists(atPath: installPath) }
-    static func isVirtualMic(_ device: Device) -> Bool { device.uid == deviceUID }
+    static func isVirtualMic(_ device: Device) -> Bool { device.uid == deviceUID || device.uid == sinkUID }
 
     /// Copies the driver in and restarts coreaudiod. Asks for an administrator password.
     /// Every engine must be stopped before this; coreaudiod's restart invalidates them all.
@@ -140,7 +145,7 @@ final class MicEngine {
             kAudioAggregateDeviceIsStackedKey: false,
             kAudioAggregateDeviceSubDeviceListKey: [
                 [kAudioSubDeviceUIDKey: source.uid],
-                [kAudioSubDeviceUIDKey: VirtualMic.deviceUID, kAudioSubDeviceDriftCompensationKey: true],
+                [kAudioSubDeviceUIDKey: VirtualMic.sinkUID, kAudioSubDeviceDriftCompensationKey: true],
             ],
         ]
         var newAggregateID = AudioObjectID(kAudioObjectUnknown)

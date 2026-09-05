@@ -635,17 +635,32 @@ final class AudioState: ObservableObject {
 
     // MARK: Microphone
 
-    /// Keeps the mic engine matched to the chosen source while processing is on.
+    /// Keeps the mic engine matched to the chosen source while processing is on. Any
+    /// state in which the engine cannot run hands the default input back to the real
+    /// microphone, so apps are never left listening to a silent virtual device.
     private func synchronizeMic() {
         guard micProcessing else { micEngine.stop(); return }
         guard virtualMicPresent else {
             micEngine.stop()
             micStatus = .failed(virtualMicInstalled ? "patchbay Mic is not available yet." : "patchbay Mic is not installed.")
+            restoreRealMicDefault()
             return
         }
         guard let source = micSource else { micEngine.stop(); micStatus = .failed("No microphone is available."); return }
         guard micEngine.sourceUID != source.uid else { return }
         micEngine.start(source: source, settings: micRack)
+        if case .failed = micEngine.status { restoreRealMicDefault() }
+    }
+
+    private func restoreRealMicDefault() {
+        guard let source = micSource else { return }
+        let defaultInput = CA.devices(input: true).first { $0.isDefault }
+        if defaultInput.map(VirtualMic.isVirtualMic) == true { CA.setDefault(source.id, input: true) }
+    }
+
+    /// Called from the app delegate on quit.
+    func prepareForQuit() {
+        if micProcessing { micEngine.stop(); restoreRealMicDefault() }
     }
 
     private var micRack: RackSettings {
@@ -667,7 +682,7 @@ final class AudioState: ObservableObject {
             UserDefaults.standard.set(true, forKey: "micProcessing")
             if rackScope == .input { rack.enabled = true }
             micEngine.start(source: source, settings: micRack)
-            if let virtual = CA.devices(input: true).first(where: VirtualMic.isVirtualMic) { CA.setDefault(virtual.id, input: true) }
+            if let virtual = CA.devices(input: true).first(where: { $0.uid == VirtualMic.deviceUID }) { CA.setDefault(virtual.id, input: true) }
         } else {
             micProcessing = false
             UserDefaults.standard.set(false, forKey: "micProcessing")
@@ -1033,11 +1048,14 @@ final class Bar: NSObject, NSPopoverDelegate {
         audio.setVisible(false)
         if let m = monitor { NSEvent.removeMonitor(m); monitor = nil }
     }
+
+    func prepareForQuit() { audio.prepareForQuit() }
 }
 
 final class Delegate: NSObject, NSApplicationDelegate {
     var bar: Bar?
     func applicationDidFinishLaunching(_ n: Notification) { bar = Bar() }
+    func applicationWillTerminate(_ n: Notification) { bar?.prepareForQuit() }
 }
 
 let app = NSApplication.shared

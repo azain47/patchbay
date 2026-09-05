@@ -131,12 +131,14 @@ without being asked.
 
 ## Microphone
 
-The one feature that touches the system. Input → *Microphone chain* → *Install
-patchbay Mic* copies a 90 KB passthrough loopback driver into
+The one feature that touches the system. Settings → *Virtual microphone* → *Install*
+copies a 90 KB passthrough loopback driver into
 `/Library/Audio/Plug-Ins/HAL/patchbayMic.driver` (asks for an administrator
 password, restarts Core Audio for about three seconds). The driver is
 [BlackHole](https://github.com/ExistentialAudio/BlackHole) (GPLv3, Existential
-Audio) built as a single 2-channel device named "patchbay Mic"; the source and
+Audio) built as two devices sharing one ring buffer: "patchbay Mic", visible and
+input-only, which apps select; and a hidden output-only sink the engine writes
+into, so the engine can never read back its own output. The source and
 build script are in `VirtualMic/`. It has no logic of its own: whatever is
 written to its output stream appears on its input stream.
 
@@ -150,9 +152,10 @@ input, so apps pick it up without configuration. Turning it off hands the
 default input back to the real microphone. The chain is edited in the rack via
 the scope chip (*Microphone*) and is remembered per microphone.
 
-Honest limits: if patchbay quits while processing is on, apps that selected
-patchbay Mic hear silence until they pick the real microphone again or patchbay
-is relaunched (it re-attaches on launch). Expect roughly 10 ms of added latency.
+On quit, and whenever the engine cannot run (driver missing, no microphone),
+patchbay hands the default input back to the real microphone, so apps are not
+left listening to a silent device. A crash is the exception. Expect roughly
+10 ms of added latency.
 *Remove* in Settings deletes the driver and restarts Core Audio again.
 
 ## License
