@@ -430,8 +430,8 @@ final class AudioState: ObservableObject {
     // MARK: Devices
 
     func refresh() {
-        // The virtual mic has an output stream too; it is never an output for the user and
-        // never a source for the chain, so it is kept out of both lists.
+        // The virtual mic is never a source for the chain and its hidden sink is never an
+        // output for the user, so both stay out of the lists.
         let all = CA.devices(input: false) + CA.devices(input: true)
         virtualMicPresent = all.contains(where: VirtualMic.isVirtualMic)
         virtualMicInstalled = VirtualMic.installed
