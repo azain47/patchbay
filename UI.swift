@@ -76,12 +76,17 @@ final class Theme: ObservableObject {
     /// Off: the popover closes when you click anywhere else. On: it stays until the menu bar
     /// icon is clicked again, for tweaking while another app has focus.
     @Published var keepOpen: Bool { didSet { UserDefaults.standard.set(keepOpen, forKey: "keepOpen") } }
+    /// How much slower a slider moves while shift is held: pointer travel × this.
+    @Published var scrubFine: Double { didSet { UserDefaults.standard.set(scrubFine, forKey: "scrubFine") } }
+    static let scrubSteps: [(Double, String)] = [(0.5, "½"), (0.25, "¼"), (0.1, "⅒"), (0.05, "1⁄20"), (0.02, "1⁄50")]
 
     private init() {
         accent = Accent(rawValue: UserDefaults.standard.string(forKey: "accent") ?? "") ?? .amber
         appearance = Appearance(rawValue: UserDefaults.standard.string(forKey: "appearance") ?? "") ?? .system
         density = Density(rawValue: UserDefaults.standard.string(forKey: "density") ?? "") ?? .auto
         keepOpen = UserDefaults.standard.bool(forKey: "keepOpen")
+        let fine = UserDefaults.standard.double(forKey: "scrubFine")
+        scrubFine = fine > 0 ? fine : 0.1
         T.accent = accent.color
     }
 
@@ -111,6 +116,15 @@ extension EnvironmentValues {
     var metrics: Theme.Metrics {
         get { self[MetricsKey.self] }
         set { self[MetricsKey.self] = newValue }
+    }
+}
+
+/// Width the module editor actually has: the page minus the chain column when it is open.
+private struct EditorWidthKey: EnvironmentKey { static let defaultValue: CGFloat = 480 }
+extension EnvironmentValues {
+    var editorWidth: CGFloat {
+        get { self[EditorWidthKey.self] }
+        set { self[EditorWidthKey.self] = newValue }
     }
 }
 
@@ -330,6 +344,13 @@ struct SettingsPopout: View {
                 Toggle(isOn: $theme.keepOpen) { Text("Stay open").font(.system(size: 11)) }
                     .toggleStyle(.switch).controlSize(.mini).tint(T.accent)
                     .help("Off: a click anywhere else closes the window. On: it stays until the menu bar icon is clicked again.")
+            }
+            SettingGroup("Shift step") {
+                Picker("", selection: $theme.scrubFine) {
+                    ForEach(Theme.scrubSteps, id: \.0) { step in Text(step.1).tag(step.0) }
+                }
+                .labelsHidden().pickerStyle(.segmented).controlSize(.small)
+                .help("Slider speed while shift is held, as a fraction of pointer travel")
             }
             SettingGroup("Accent") {
                 HStack(spacing: 8) {
@@ -763,7 +784,7 @@ struct LevelRow: View {
             } else {
                 Image(systemName: icon).font(.system(size: 11)).foregroundStyle(.tertiary).frame(width: 28)
             }
-            Fader(value: value, range: 0...1, set: set).opacity(muted ? 0.4 : 1)
+            Fader(value: value, range: 0...1, label: { "\(Int(($0 * 100).rounded()))%" }, set: set).opacity(muted ? 0.4 : 1)
             Text(muted ? "muted" : "\(Int((value * 100).rounded()))%").font(m.mono).foregroundStyle(.secondary).frame(width: 44, alignment: .trailing)
         }
         .padding(.horizontal, m.gutter)
@@ -804,13 +825,53 @@ struct MeterPair: View {
     }
 }
 
+/// Shared scrub behaviour for both faders. Plain drag is absolute: the knob goes where the
+/// pointer is. With shift held the drag turns relative and ten times finer, accumulating in
+/// an unrounded position so parameters with coarse steps still creep one step at a time,
+/// and a bubble on the knob shows the value being dialled.
+struct Scrub {
+    var last: CGFloat?
+    var position: Double?
+    var shift = false
+
+    /// Returns the new normalised position for a pointer at `p` along an axis of length `length`.
+    mutating func step(pointer p: CGFloat, length: CGFloat, current: Double) -> Double {
+        shift = NSEvent.modifierFlags.contains(.shift)
+        defer { last = p }
+        guard shift else { position = nil; return Double(p / length) }
+        let base = position ?? current
+        let delta = last.map { Double((p - $0) / length) * Theme.shared.scrubFine } ?? 0
+        let next = min(1, max(0, base + delta))
+        position = next
+        return next
+    }
+
+    mutating func end() { last = nil; position = nil; shift = false }
+}
+
+/// Value bubble shown on a knob while shift-scrubbing.
+struct ScrubBubble: View {
+    let text: String
+    var body: some View {
+        Text(text).font(.system(size: 10, weight: .medium, design: .monospaced))
+            .padding(.horizontal, 6).padding(.vertical, 3)
+            .background(Capsule().fill(.regularMaterial))
+            .overlay(Capsule().strokeBorder(T.hairline, lineWidth: 0.5))
+            .fixedSize()
+            .transition(.opacity.combined(with: .scale(scale: 0.9)))
+    }
+}
+
 struct Fader: View {
     let value: Double
     let range: ClosedRange<Double>
     var log = false
     var center: Double? = nil
+    /// How the bubble prints the value; nil falls back to a plain number.
+    var label: ((Double) -> String)? = nil
     let set: (Double) -> Void
     @State private var dragging = false
+    @State private var scrub = Scrub()
 
     private func norm(_ v: Double) -> Double {
         if log { return (Foundation.log(max(v, range.lowerBound)) - Foundation.log(range.lowerBound)) / (Foundation.log(range.upperBound) - Foundation.log(range.lowerBound)) }
@@ -821,6 +882,7 @@ struct Fader: View {
         if log { return exp(Foundation.log(range.lowerBound) + t * (Foundation.log(range.upperBound) - Foundation.log(range.lowerBound))) }
         return range.lowerBound + t * (range.upperBound - range.lowerBound)
     }
+    private var bubbleText: String { label?(value) ?? String(format: abs(value) < 10 ? "%.2f" : "%.1f", value) }
 
     var body: some View {
         GeometryReader { g in
@@ -839,10 +901,26 @@ struct Fader: View {
                     .shadow(color: .black.opacity(0.35), radius: 1.5, y: 0.5)
                     .offset(x: max(0, min(w - 11, x - 5.5)))
                     .animation(T.quick, value: dragging)
+                    .overlay(alignment: .leading) {
+                        // Beside the knob, not above it: rows sit at the top of a clipping scroll view.
+                        if dragging && scrub.shift {
+                            let knob = max(0, min(w - 11, x - 5.5))
+                            let onLeft = knob > w / 2
+                            ScrubBubble(text: bubbleText)
+                                .offset(x: onLeft ? knob - 6 : knob + 17)
+                                .alignmentGuide(.leading) { d in onLeft ? d[.trailing] : d[.leading] }
+                        }
+                    }
             }
             .frame(height: 18)
             .contentShape(Rectangle())
-            .gesture(DragGesture(minimumDistance: 0).onChanged { v in dragging = true; set(denorm(v.location.x / w)) }.onEnded { _ in dragging = false })
+            .gesture(DragGesture(minimumDistance: 0)
+                .onChanged { v in
+                    dragging = true
+                    set(denorm(scrub.step(pointer: v.location.x, length: w, current: norm(value))))
+                }
+                .onEnded { _ in dragging = false; scrub.end() })
+            .animation(T.quick, value: scrub.shift)
         }
         .frame(height: 18)
     }
@@ -851,8 +929,12 @@ struct Fader: View {
 struct VFader: View {
     let value: Double
     let range: ClosedRange<Double>
+    var label: ((Double) -> String)? = nil
     let set: (Double) -> Void
     @State private var dragging = false
+    @State private var scrub = Scrub()
+
+    private var bubbleText: String { label?(value) ?? String(format: "%+.1f", value) }
 
     var body: some View {
         GeometryReader { g in
@@ -868,14 +950,24 @@ struct VFader: View {
                     .shadow(color: .black.opacity(0.35), radius: 1.5, y: 0.5)
                     .offset(y: max(0, min(h - 11, y - 5.5)))
                     .animation(T.quick, value: dragging)
+                    .overlay(alignment: .top) {
+                        if dragging && scrub.shift {
+                            ScrubBubble(text: bubbleText)
+                                .offset(x: 22, y: max(0, min(h - 11, y - 5.5)) - 2)
+                        }
+                    }
             }
             .frame(maxWidth: .infinity)
             .contentShape(Rectangle())
-            .gesture(DragGesture(minimumDistance: 0).onChanged { v in
-                dragging = true
-                let t = min(1, max(0, 1 - v.location.y / h))
-                set(range.lowerBound + t * (range.upperBound - range.lowerBound))
-            }.onEnded { _ in dragging = false })
+            .gesture(DragGesture(minimumDistance: 0)
+                .onChanged { v in
+                    dragging = true
+                    // Screen y grows downward; measure from the bottom so the axis grows with the fader.
+                    let t = scrub.step(pointer: h - v.location.y, length: h, current: n)
+                    set(range.lowerBound + min(1, max(0, t)) * (range.upperBound - range.lowerBound))
+                }
+                .onEnded { _ in dragging = false; scrub.end() })
+            .animation(T.quick, value: scrub.shift)
         }
     }
 }
@@ -895,7 +987,7 @@ struct ParamRow: View {
                 }
                 .labelsHidden().pickerStyle(.segmented).controlSize(.small)
             } else {
-                Fader(value: value, range: spec.range, log: spec.log, center: spec.range.contains(0) && spec.range.lowerBound < 0 ? 0 : nil) { v in
+                Fader(value: value, range: spec.range, log: spec.log, center: spec.range.contains(0) && spec.range.lowerBound < 0 ? 0 : nil, label: format) { v in
                     set(spec.step > 0 ? (v / spec.step).rounded() * spec.step : v)
                 }
                 Text(format(value)).font(m.mono).foregroundStyle(.secondary).lineLimit(1).frame(width: 58, alignment: .trailing)
@@ -923,13 +1015,18 @@ struct RackTab: View {
     /// False while another page is in front; the analyser stops and the graph unmounts.
     var active = true
     @AppStorage("showGraph") private var showGraph = false
+    @AppStorage("chainOpen") private var chainOpen = true
 
     var body: some View {
+        let editorWidth = chainOpen ? m.width - m.chainW - 0.5 : m.width
         VStack(spacing: 0) {
             HStack(spacing: 0) {
-                ChainColumn(audio: audio)
-                    .frame(width: m.chainW)
-                Rectangle().fill(T.hairline).frame(width: 0.5)
+                if chainOpen {
+                    ChainColumn(audio: audio)
+                        .frame(width: m.chainW)
+                        .transition(.move(edge: .leading).combined(with: .opacity))
+                    Rectangle().fill(T.hairline).frame(width: 0.5)
+                }
                 VStack(spacing: 0) {
                     if showGraph && active {
                         Graph(audio: audio)
@@ -938,15 +1035,19 @@ struct RackTab: View {
                             .transition(.opacity)
                         Rectangle().fill(T.hairline).frame(height: 0.5)
                     }
-                    ModuleEditor(audio: audio)
+                    ModuleEditor(audio: audio, chainOpen: chainOpen)
                 }
-                .frame(width: m.width - m.chainW - 0.5)
+                .frame(width: editorWidth)
                 .clipped()
+                .environment(\.editorWidth, editorWidth)
             }
+            .clipped()
             Rectangle().fill(T.hairline).frame(height: 0.5)
 
             HStack(spacing: 12) {
                 MeterPair(meters: audio.meters)
+                IconButton("sidebar.left", active: chainOpen) { withAnimation(T.quick) { chainOpen.toggle() } }
+                    .help(chainOpen ? "Hide chain" : "Show chain")
                 IconButton("waveform.path.ecg", active: showGraph) { withAnimation(T.quick) { showGraph.toggle() } }
                     .help(showGraph ? "Hide graph" : "Show response and spectrum")
                 Button { audio.setBypass(!audio.rack.bypass) } label: {
@@ -1048,13 +1149,12 @@ struct ChainColumn: View {
                     HStack(spacing: 5) {
                         Image(systemName: audio.rackScope.symbol).font(.system(size: 10))
                         Text(scopeName).font(.system(size: 11.5, weight: .semibold)).lineLimit(1)
-                        Image(systemName: "chevron.up.chevron.down").font(.system(size: 8, weight: .semibold)).foregroundStyle(.tertiary)
                     }
                     .foregroundStyle(T.accent)
-                    .padding(.horizontal, 9).padding(.vertical, 5)
-                    .background(Capsule().fill(T.accent.opacity(0.12)))
                 }
-                .menuStyle(.borderlessButton).menuIndicator(.hidden).fixedSize()
+                .menuStyle(.borderlessButton).menuIndicator(.visible).fixedSize()
+                .padding(.leading, 9).padding(.trailing, 3).padding(.vertical, 4)
+                .background(Capsule().fill(T.accent.opacity(0.12)))
                 .help("Which chain to edit")
                 .padding(.horizontal, m.gutter - 4).padding(.top, m.sectionTop).padding(.bottom, m.gap)
             } else {
@@ -1163,13 +1263,51 @@ struct ChainRow: View {
 struct ModuleEditor: View {
     @Environment(\.metrics) private var m
     @ObservedObject var audio: AudioState
+    /// With the chain column hidden the header title turns into the module picker, so
+    /// switching and adding modules never needs the column.
+    var chainOpen = true
 
     var body: some View {
         if let module = audio.selected {
             VStack(alignment: .leading, spacing: 0) {
                 HStack(spacing: 8) {
-                    Image(systemName: module.kind.symbol).font(.system(size: 12)).foregroundStyle(T.accent)
-                    Text(module.title).font(.system(size: 13, weight: .semibold)).lineLimit(1)
+                    Button { audio.setModuleEnabled(module.id, !module.enabled) } label: {
+                        Circle().fill(module.enabled ? T.accent : Color.primary.opacity(0.18)).frame(width: 6, height: 6)
+                            .frame(width: 12, height: 12).contentShape(Rectangle())
+                    }
+                    .buttonStyle(.plain)
+                    .help(module.enabled ? "Bypass this module" : "Enable this module")
+                    if chainOpen {
+                        Image(systemName: module.kind.symbol).font(.system(size: 12)).foregroundStyle(T.accent)
+                        Text(module.title).font(.system(size: 13, weight: .semibold)).lineLimit(1)
+                    } else {
+                        Menu {
+                            ForEach(audio.rack.modules) { other in
+                                Button { audio.selectedModule = other.id } label: {
+                                    HStack { Label(other.title, systemImage: other.kind.symbol); if other.id == module.id { Image(systemName: "checkmark") } }
+                                }
+                            }
+                            Divider()
+                            Menu("Add") {
+                                ForEach(["Tone", "Character", "Dynamics", "Space"], id: \.self) { group in
+                                    Section(group) {
+                                        ForEach(ModuleKind.allCases.filter { $0.group == group }) { kind in
+                                            Button { audio.addModule(kind) } label: { Label(kind.title, systemImage: kind.symbol) }
+                                        }
+                                    }
+                                }
+                            }
+                        } label: {
+                            HStack(spacing: 6) {
+                                Image(systemName: module.kind.symbol).font(.system(size: 12)).foregroundStyle(T.accent)
+                                Text(module.title).font(.system(size: 13, weight: .semibold)).lineLimit(1)
+                            }
+                        }
+                        .menuStyle(.borderlessButton).menuIndicator(.visible).fixedSize()
+                        .padding(.leading, 6).padding(.trailing, 2).padding(.vertical, 3)
+                        .background(RoundedRectangle(cornerRadius: 6).fill(T.card))
+                        .help("Which module to edit")
+                    }
                     if module.name != nil { Text(module.kind.title).font(m.monoSmall).foregroundStyle(.tertiary).lineLimit(1).fixedSize() }
                     Spacer(minLength: 4)
                     IconButton("arrow.counterclockwise") { audio.resetModule(module.id) }.help("Reset module")
@@ -1347,6 +1485,7 @@ struct ParametricEditor: View {
 /// edit its type, frequency and Q below.
 struct BandColumns: View {
     @Environment(\.metrics) private var m
+    @Environment(\.editorWidth) private var editorWidth
     let bands: [EQBand]
     let selected: UUID?
     let height: CGFloat
@@ -1356,7 +1495,7 @@ struct BandColumns: View {
     var body: some View {
         // Each column needs ~34 pt for its labels; past what the editor column can hold,
         // switch to fixed-width columns that scroll sideways.
-        let available = m.width - m.chainW - 2 * m.gutter - 12
+        let available = editorWidth - 2 * m.gutter - 12
         let dense = CGFloat(bands.count) * 34 > available
         let columns = HStack(alignment: .bottom, spacing: dense ? 4 : 6) {
             ForEach(bands) { band in
@@ -1388,7 +1527,7 @@ struct BandColumn: View {
         VStack(spacing: 5) {
             Text(band.type.usesGain ? String(format: "%+.0f", band.gainDB) : "·")
                 .font(m.monoSmall).foregroundStyle(selected ? .primary : .tertiary).lineLimit(1)
-            VFader(value: band.gainDB, range: -18...18) { setGain(($0 * 2).rounded() / 2) }
+            VFader(value: band.gainDB, range: -18...18, label: { String(format: "%+.1f dB", $0) }) { setGain(($0 * 2).rounded() / 2) }
                 .frame(height: height)
                 .opacity(band.type.usesGain ? 1 : 0.3)
                 .disabled(!band.type.usesGain)
@@ -1413,6 +1552,8 @@ struct BandDetail: View {
     let toggle: () -> Void
     let remove: () -> Void
 
+    private static func hz(_ f: Double) -> String { f >= 1000 ? String(format: "%.2f kHz", f / 1000) : String(format: "%.0f Hz", f) }
+
     var body: some View {
         VStack(spacing: 6) {
             HStack(spacing: 8) {
@@ -1424,15 +1565,17 @@ struct BandDetail: View {
                 }
                 .labelsHidden().controlSize(.small).frame(width: 92)
                 Spacer(minLength: 4)
-                Text(band.frequency >= 1000 ? String(format: "%.2f kHz", band.frequency / 1000) : String(format: "%.0f Hz", band.frequency))
-                    .font(m.mono).foregroundStyle(.secondary).lineLimit(1)
-                Text(String(format: "Q %.2f", band.q)).font(m.mono).foregroundStyle(.secondary).lineLimit(1)
                 IconButton("xmark") { remove() }.help("Remove filter")
             }
             HStack(spacing: 8) {
-                Fader(value: band.frequency, range: 20...20_000, log: true, set: setFreq)
-                Text("Q").font(m.monoSmall).foregroundStyle(.tertiary)
-                Fader(value: band.q, range: 0.1...12, log: true, set: setQ).frame(width: m.subtitle ? 80 : 56)
+                Text("Freq").font(.system(size: 11)).foregroundStyle(.secondary).frame(width: 34, alignment: .leading)
+                Fader(value: band.frequency, range: 20...20_000, log: true, label: Self.hz, set: setFreq)
+                Text(Self.hz(band.frequency)).font(m.mono).foregroundStyle(.secondary).lineLimit(1).frame(width: 64, alignment: .trailing)
+            }
+            HStack(spacing: 8) {
+                Text("Q").font(.system(size: 11)).foregroundStyle(.secondary).frame(width: 34, alignment: .leading)
+                Fader(value: band.q, range: 0.1...12, log: true, label: { String(format: "%.2f", $0) }, set: setQ)
+                Text(String(format: "%.2f", band.q)).font(m.mono).foregroundStyle(.secondary).lineLimit(1).frame(width: 64, alignment: .trailing)
             }
         }
         .padding(.vertical, m.bandV).padding(.horizontal, 8)
@@ -1500,7 +1643,7 @@ struct GraphicEditor: View {
                 ForEach(module.bands) { band in
                     VStack(spacing: 6) {
                         Text(String(format: "%+.0f", band.gainDB)).font(m.monoSmall).foregroundStyle(.tertiary)
-                        VFader(value: band.gainDB, range: -12...12) { g in audio.setBand(module.id, band.id) { $0.gainDB = (g * 2).rounded() / 2 } }
+                        VFader(value: band.gainDB, range: -12...12, label: { String(format: "%+.1f dB", $0) }) { g in audio.setBand(module.id, band.id) { $0.gainDB = (g * 2).rounded() / 2 } }
                             .frame(height: 160)
                         Text(band.frequency >= 1000 ? String(format: "%.0fk", band.frequency / 1000) : String(format: "%.0f", band.frequency))
                             .font(m.monoSmall).foregroundStyle(.tertiary)

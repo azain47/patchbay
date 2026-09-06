@@ -42,14 +42,20 @@ opens and closes without animation; in-app motion is short springs.
   rebuilt on a tab switch. *Compact*, *Comfortable* and *Spacious* pin one
   density everywhere.
 - **Settings** live behind the gear in the footer: appearance (system, dark,
-  light — applied to the popover itself), layout, window behaviour (close on a
-  click elsewhere, or stay until the menu bar icon is clicked again), accent
-  colour, audio capture topology, and the virtual microphone driver.
-- The chain is a vertical stack beside the module editor in signal order, first
+  light — applied to the popover itself), layout, *Stay open* (otherwise a
+  click anywhere else closes the window), the shift step, accent colour, audio
+  capture topology, and the virtual microphone driver.
+- The chain is a vertical column beside the module editor in signal order, first
   stage on top. Click a row to edit it, press and drag to reorder (the row
   follows the pointer, the others slide out of its way), dot to bypass one
-  module. The icon beside the name in the header is the chain being edited:
-  waveform for the system chain, branch for a route, mic for the microphone.
+  module. The sidebar button in the rack footer hides the column; the editor's
+  title then becomes the module picker, with *Add* inside it. The icon beside
+  the name in the header is the chain being edited: waveform for the system
+  chain, branch for a route, mic for the microphone.
+- **Sliders**: hold shift while dragging for fine control. The drag turns
+  relative and slows to the *Shift step* set in Settings (½ to 1⁄50 of pointer
+  travel), and a bubble on the knob shows the value being dialled. Applies to
+  every slider, including the EQ gain columns.
 - **Parametric EQ** is a row of vertical gain faders, one per filter, low to
   high frequency. Tap a column to edit its type, frequency and Q in the rows
   below; the currently selected column is highlighted. Once the columns no
