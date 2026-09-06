@@ -284,7 +284,16 @@ final class AudioState: ObservableObject {
 
     // Routing: which app goes where. `rack` always holds the chain being edited; `rackScope`
     // says whether that is the system chain, one route's chain, or the microphone chain.
-    enum RackScope: Equatable { case system, route(UUID), input }
+    enum RackScope: Equatable {
+        case system, route(UUID), input
+        var symbol: String {
+            switch self {
+            case .system: "waveform"
+            case .route: "arrow.triangle.branch"
+            case .input: "mic"
+            }
+        }
+    }
     @Published var rackScope: RackScope = .system
 
     // Microphone: real mic → chain → "patchbay Mic" virtual device, opt-in driver install.
@@ -306,7 +315,18 @@ final class AudioState: ObservableObject {
     @Published var outputVolume: Float?
     @Published var outputRates: [Double] = []
     @Published var diagnostics = SystemAudioEngine.Diagnostics()
-    @Published var notice: String?
+    /// Transient message shown at the bottom of the popover; clears itself after 3 s.
+    /// Expiry lives here, not in the view, so a notice replacing another restarts the clock.
+    @Published var notice: String? {
+        didSet {
+            noticeExpiry?.cancel()
+            guard notice != nil else { return }
+            let expiry = DispatchWorkItem { [weak self] in withAnimation(T.quick) { self?.notice = nil } }
+            noticeExpiry = expiry
+            DispatchQueue.main.asyncAfter(deadline: .now() + 3, execute: expiry)
+        }
+    }
+    private var noticeExpiry: DispatchWorkItem?
 
     let autoEQ = AutoEQCatalog()
 
@@ -802,7 +822,6 @@ final class AudioState: ObservableObject {
         let at = rack.modules.lastIndex { $0.kind.stage <= kind.stage }.map { $0 + 1 } ?? 0
         update { $0.modules.insert(module, at: at) }
         selectedModule = module.id
-        if at > 0 { notice = "\(kind.title) placed after \(rack.modules[at - 1].title)" }
     }
 
     func removeModule(_ id: UUID) {
@@ -812,13 +831,6 @@ final class AudioState: ObservableObject {
 
     func moveModule(from source: IndexSet, to destination: Int) {
         update { $0.modules.move(fromOffsets: source, toOffset: destination) }
-    }
-
-    func moveModule(_ id: UUID, by offset: Int) {
-        guard let index = rack.modules.firstIndex(where: { $0.id == id }) else { return }
-        let dest = index + offset
-        guard rack.modules.indices.contains(dest) else { return }
-        update { $0.modules.swapAt(index, dest) }
     }
 
     func setModuleEnabled(_ id: UUID, _ enabled: Bool) { updateModule(id) { $0.enabled = enabled } }
@@ -1008,8 +1020,9 @@ final class Bar: NSObject, NSPopoverDelegate {
     private var pop: NSPopover!
     private let audio = AudioState()
     private var monitor: Any?
+    private var resignObserver: NSObjectProtocol?
+    private var keepOpenSink: AnyCancellable?
     private var appearanceSink: AnyCancellable?
-
     override init() {
         super.init()
         item = NSStatusBar.system.statusItem(withLength: NSStatusItem.variableLength)
@@ -1020,7 +1033,11 @@ final class Bar: NSObject, NSPopoverDelegate {
         appearanceSink = Theme.shared.$appearance.sink { [weak self] a in
             self?.pop.appearance = a == .system ? nil : NSAppearance(named: a == .dark ? .darkAqua : .aqua)
         }
-        pop.behavior = .transient
+        keepOpenSink = Theme.shared.$keepOpen.sink { [weak self] keep in
+            guard let self else { return }
+            pop.behavior = keep ? .applicationDefined : .transient
+            if keep { stopWatchingOutside() } else if pop.isShown { watchOutside() }
+        }
         pop.animates = false
         pop.delegate = self
         if let b = item.button {
@@ -1042,17 +1059,40 @@ final class Bar: NSObject, NSPopoverDelegate {
         pop.show(relativeTo: b.bounds, of: b, preferredEdge: .minY)
         pop.contentViewController?.view.window?.makeKey()
         audio.setVisible(true)
+        if !Theme.shared.keepOpen { watchOutside() }
+    }
+
+    /// Two nets for "clicked somewhere else": a global mouse monitor for clicks that reach
+    /// other apps, and the popover window losing key status for the cases a monitor never
+    /// sees (menu bar extras, menu tracking sessions, Spotlight, Mission Control).
+    private func watchOutside() {
+        stopWatchingOutside()
         monitor = NSEvent.addGlobalMonitorForEvents(matching: [.leftMouseDown, .rightMouseDown]) { [weak self] _ in self?.hide() }
+        if let window = pop.contentViewController?.view.window {
+            resignObserver = NotificationCenter.default.addObserver(forName: NSWindow.didResignKeyNotification, object: window, queue: .main) { [weak self] _ in
+                // Our own menus and the settings popout take key briefly; those leave a key
+                // window of ours behind. Focus going to another app leaves none.
+                DispatchQueue.main.async {
+                    guard let self, self.pop.isShown, !Theme.shared.keepOpen, NSApp.keyWindow == nil else { return }
+                    self.hide()
+                }
+            }
+        }
+    }
+
+    private func stopWatchingOutside() {
+        if let m = monitor { NSEvent.removeMonitor(m); monitor = nil }
+        if let r = resignObserver { NotificationCenter.default.removeObserver(r); resignObserver = nil }
     }
 
     private func hide() {
         pop.performClose(nil)
-        if let m = monitor { NSEvent.removeMonitor(m); monitor = nil }
+        stopWatchingOutside()
     }
 
     func popoverDidClose(_ notification: Notification) {
         audio.setVisible(false)
-        if let m = monitor { NSEvent.removeMonitor(m); monitor = nil }
+        stopWatchingOutside()
     }
 
     func prepareForQuit() { audio.prepareForQuit() }

@@ -45,13 +45,13 @@ final class Theme: ObservableObject {
             switch self {
             case .auto, .compact:
                 Metrics(width: 400, maxHeight: 480, gutter: 12, rowV: 3, rowGap: 0, badge: 22, nameSize: 12, monoSize: 10,
-                        sectionTop: 8, paramH: 20, gap: 6, bandV: 4, faderH: 84, subtitle: false)
+                        sectionTop: 8, paramH: 20, gap: 6, bandV: 4, faderH: 84, chainW: 140, chainRowH: 26, subtitle: false)
             case .comfortable:
                 Metrics(width: 460, maxHeight: 560, gutter: 16, rowV: 6, rowGap: 2, badge: 26, nameSize: 13, monoSize: 10.5,
-                        sectionTop: 12, paramH: 24, gap: 10, bandV: 7, faderH: 100, subtitle: true)
+                        sectionTop: 12, paramH: 24, gap: 10, bandV: 7, faderH: 100, chainW: 156, chainRowH: 28, subtitle: true)
             case .spacious:
                 Metrics(width: 540, maxHeight: 640, gutter: 20, rowV: 9, rowGap: 4, badge: 30, nameSize: 13.5, monoSize: 11,
-                        sectionTop: 16, paramH: 28, gap: 14, bandV: 10, faderH: 120, subtitle: true)
+                        sectionTop: 16, paramH: 28, gap: 14, bandV: 10, faderH: 120, chainW: 170, chainRowH: 30, subtitle: true)
             }
         }
     }
@@ -60,7 +60,7 @@ final class Theme: ObservableObject {
     /// its own view identity no matter which page is in front.
     struct Metrics: Equatable {
         var width: CGFloat
-        let maxHeight, gutter, rowV, rowGap, badge, nameSize, monoSize, sectionTop, paramH, gap, bandV, faderH: CGFloat
+        let maxHeight, gutter, rowV, rowGap, badge, nameSize, monoSize, sectionTop, paramH, gap, bandV, faderH, chainW, chainRowH: CGFloat
         let subtitle: Bool
 
         var name: Font { .system(size: nameSize, weight: .regular) }
@@ -73,11 +73,15 @@ final class Theme: ObservableObject {
     @Published var density: Density { didSet { UserDefaults.standard.set(density.rawValue, forKey: "density") } }
     @Published var accent: Accent { didSet { UserDefaults.standard.set(accent.rawValue, forKey: "accent"); T.accent = accent.color } }
     @Published var appearance: Appearance { didSet { UserDefaults.standard.set(appearance.rawValue, forKey: "appearance") } }
+    /// Off: the popover closes when you click anywhere else. On: it stays until the menu bar
+    /// icon is clicked again, for tweaking while another app has focus.
+    @Published var keepOpen: Bool { didSet { UserDefaults.standard.set(keepOpen, forKey: "keepOpen") } }
 
     private init() {
         accent = Accent(rawValue: UserDefaults.standard.string(forKey: "accent") ?? "") ?? .amber
         appearance = Appearance(rawValue: UserDefaults.standard.string(forKey: "appearance") ?? "") ?? .system
         density = Density(rawValue: UserDefaults.standard.string(forKey: "density") ?? "") ?? .auto
+        keepOpen = UserDefaults.standard.bool(forKey: "keepOpen")
         T.accent = accent.color
     }
 
@@ -140,11 +144,17 @@ struct SectionLabel: View {
     }
 }
 
+/// The icon beside the name is the chain being edited (system, a route, the microphone),
+/// so the header says what the rack page will show before you get there.
 struct Wordmark: View {
+    let scope: AudioState.RackScope
     var body: some View {
         HStack(spacing: 7) {
-            Image(systemName: "waveform").font(.system(size: 12, weight: .bold)).foregroundStyle(T.accent)
-            Text("patchbay").font(.system(size: 14, weight: .semibold, design: .rounded)).tracking(-0.2)
+            Image(systemName: scope.symbol).font(.system(size: 12, weight: .bold)).foregroundStyle(T.accent)
+                .frame(width: 16)
+                .contentTransition(.symbolEffect(.replace))
+                .animation(T.quick, value: scope)
+            Text("patchbay.").font(.system(size: 14, weight: .semibold, design: .rounded)).tracking(-0.2)
         }
     }
 }
@@ -175,7 +185,7 @@ struct Root: View {
         let front = theme.density.metrics(for: tab)
         VStack(spacing: 0) {
             HStack(spacing: 14) {
-                Wordmark()
+                Wordmark(scope: audio.rackScope)
                 Spacer()
                 TabBar(tab: $audio.tab)
                 Spacer()
@@ -220,7 +230,6 @@ struct Root: View {
                     .background(Capsule().fill(.ultraThinMaterial))
                     .padding(.bottom, 48)
                     .transition(.move(edge: .bottom).combined(with: .opacity))
-                    .onAppear { DispatchQueue.main.asyncAfter(deadline: .now() + 3) { withAnimation(T.quick) { audio.notice = nil } } }
             }
         }
         .onChange(of: audio.rackStatus) { _, s in if case .failed(let message) = s { audio.notice = message } }
@@ -316,6 +325,14 @@ struct SettingsPopout: View {
                     Text("Compact on the device pages, spacious on the rack. The window follows its content.")
                         .font(.system(size: 10.5)).foregroundStyle(.tertiary).fixedSize(horizontal: false, vertical: true)
                 }
+            }
+            SettingGroup("Window") {
+                Toggle(isOn: $theme.keepOpen) {
+                    Text("Stay open until the menu bar icon is clicked again").font(.system(size: 11))
+                }
+                .toggleStyle(.switch).controlSize(.mini).tint(T.accent)
+                Text(theme.keepOpen ? "Clicks elsewhere leave the window up." : "A click anywhere else closes the window.")
+                    .font(.system(size: 10.5)).foregroundStyle(.tertiary).fixedSize(horizontal: false, vertical: true)
             }
             SettingGroup("Accent") {
                 HStack(spacing: 8) {
@@ -874,7 +891,7 @@ struct ParamRow: View {
 
     var body: some View {
         HStack(spacing: 12) {
-            Text(spec.label).font(.system(size: 11.5)).foregroundStyle(.secondary).frame(width: 70, alignment: .leading)
+            Text(spec.label).font(.system(size: 11.5)).foregroundStyle(.secondary).lineLimit(1).frame(width: 62, alignment: .leading)
             if let options = spec.options {
                 Picker("", selection: Binding(get: { Int(value.rounded()) }, set: { set(Double($0)) })) {
                     ForEach(Array(options.enumerated()), id: \.offset) { i, o in Text(o).tag(i + Int(spec.range.lowerBound)) }
@@ -884,7 +901,7 @@ struct ParamRow: View {
                 Fader(value: value, range: spec.range, log: spec.log, center: spec.range.contains(0) && spec.range.lowerBound < 0 ? 0 : nil) { v in
                     set(spec.step > 0 ? (v / spec.step).rounded() * spec.step : v)
                 }
-                Text(format(value)).font(m.mono).foregroundStyle(.secondary).frame(width: 66, alignment: .trailing)
+                Text(format(value)).font(m.mono).foregroundStyle(.secondary).lineLimit(1).frame(width: 58, alignment: .trailing)
             }
         }
         .frame(height: m.paramH)
@@ -912,17 +929,23 @@ struct RackTab: View {
 
     var body: some View {
         VStack(spacing: 0) {
-            ChainStrip(audio: audio)
-            Rectangle().fill(T.hairline).frame(height: 0.5)
-            if showGraph && active {
-                Graph(audio: audio)
-                    .frame(height: m.faderH + 40)
-                    .padding(.horizontal, m.gutter).padding(.vertical, m.gap)
-                    .transition(.opacity)
-                Rectangle().fill(T.hairline).frame(height: 0.5)
+            HStack(spacing: 0) {
+                ChainColumn(audio: audio)
+                    .frame(width: m.chainW)
+                Rectangle().fill(T.hairline).frame(width: 0.5)
+                VStack(spacing: 0) {
+                    if showGraph && active {
+                        Graph(audio: audio)
+                            .frame(height: m.faderH + 40)
+                            .padding(.horizontal, m.gutter).padding(.vertical, m.gap)
+                            .transition(.opacity)
+                        Rectangle().fill(T.hairline).frame(height: 0.5)
+                    }
+                    ModuleEditor(audio: audio)
+                }
+                .frame(width: m.width - m.chainW - 0.5)
+                .clipped()
             }
-            ModuleEditor(audio: audio).frame(maxWidth: .infinity)
-
             Rectangle().fill(T.hairline).frame(height: 0.5)
 
             HStack(spacing: 12) {
@@ -972,10 +995,16 @@ struct RackTab: View {
     }
 }
 
-/// The signal chain as chips in processing order, first stage on the left. Drag to reorder.
-struct ChainStrip: View {
+/// The signal chain as a vertical stack in processing order, first stage on top. Press and
+/// drag a row to reorder: it follows the pointer, the others slide out of its way, release
+/// commits. The scope chip on top says which chain this is.
+struct ChainColumn: View {
     @Environment(\.metrics) private var m
     @ObservedObject var audio: AudioState
+    @State private var dragging: UUID?
+    @State private var dragOffset: CGFloat = 0
+
+    private var rowPitch: CGFloat { m.chainRowH + 4 }
 
     private var scopeName: String {
         switch audio.rackScope {
@@ -985,8 +1014,23 @@ struct ChainStrip: View {
         }
     }
 
+    /// Where the held row would land if released now.
+    private func target(from index: Int) -> Int {
+        let shifted = Int((dragOffset / rowPitch).rounded())
+        return min(max(index + shifted, 0), audio.rack.modules.count - 1)
+    }
+
+    private func displacement(of index: Int) -> CGFloat {
+        guard let dragging, let from = audio.rack.modules.firstIndex(where: { $0.id == dragging }) else { return 0 }
+        if audio.rack.modules[index].id == dragging { return dragOffset }
+        let to = target(from: from)
+        if from < index, index <= to { return -rowPitch }
+        if to <= index, index < from { return rowPitch }
+        return 0
+    }
+
     var body: some View {
-        HStack(spacing: 6) {
+        VStack(alignment: .leading, spacing: 0) {
             if !audio.routes.isEmpty || audio.virtualMicInstalled {
                 Menu {
                     Button { audio.setRackScope(.system) } label: {
@@ -1005,7 +1049,7 @@ struct ChainStrip: View {
                     }
                 } label: {
                     HStack(spacing: 5) {
-                        Image(systemName: audio.rackScope == .system ? "macwindow.on.rectangle" : audio.rackScope == .input ? "mic" : "arrow.triangle.branch").font(.system(size: 10))
+                        Image(systemName: audio.rackScope.symbol).font(.system(size: 10))
                         Text(scopeName).font(.system(size: 11.5, weight: .semibold)).lineLimit(1)
                         Image(systemName: "chevron.up.chevron.down").font(.system(size: 8, weight: .semibold)).foregroundStyle(.tertiary)
                     }
@@ -1015,74 +1059,107 @@ struct ChainStrip: View {
                 }
                 .menuStyle(.borderlessButton).menuIndicator(.hidden).fixedSize()
                 .help("Which chain to edit")
-                .padding(.leading, m.gutter)
-                Rectangle().fill(T.hairline).frame(width: 0.5, height: 18)
+                .padding(.horizontal, m.gutter - 4).padding(.top, m.sectionTop).padding(.bottom, m.gap)
+            } else {
+                SectionLabel(text: "Chain").padding(.horizontal, m.gutter - 4).padding(.top, m.sectionTop).padding(.bottom, m.gap)
             }
-            ScrollView(.horizontal, showsIndicators: false) {
-                HStack(spacing: 6) {
-                ForEach(audio.rack.modules) { m in
-                    ChainChip(module: m, selected: audio.selectedModule == m.id,
-                              select: { audio.selectedModule = m.id },
-                              toggle: { audio.setModuleEnabled(m.id, !m.enabled) })
-                        .draggable(m.id.uuidString)
-                        .dropDestination(for: String.self) { items, _ in
-                            guard let s = items.first, let from = UUID(uuidString: s),
-                                  let fi = audio.rack.modules.firstIndex(where: { $0.id == from }),
-                                  let ti = audio.rack.modules.firstIndex(where: { $0.id == m.id }), fi != ti else { return false }
-                            withAnimation(T.quick) { audio.moveModule(from: IndexSet(integer: fi), to: ti > fi ? ti + 1 : ti) }
-                            return true
-                        }
-                }
-                Menu {
-                    ForEach(["Tone", "Character", "Dynamics", "Space"], id: \.self) { group in
-                        Section(group) {
-                            ForEach(ModuleKind.allCases.filter { $0.group == group }) { kind in
-                                Button { audio.addModule(kind) } label: { Label(kind.title, systemImage: kind.symbol) }
-                            }
-                        }
+
+            ScrollView(showsIndicators: false) {
+                VStack(spacing: 4) {
+                    ForEach(Array(audio.rack.modules.enumerated()), id: \.element.id) { index, module in
+                        ChainRow(module: module, selected: audio.selectedModule == module.id, lifted: dragging == module.id,
+                                 select: { audio.selectedModule = module.id },
+                                 toggle: { audio.setModuleEnabled(module.id, !module.enabled) })
+                            .frame(height: m.chainRowH)
+                            .offset(y: displacement(of: index))
+                            .zIndex(dragging == module.id ? 1 : 0)
+                            .gesture(
+                                DragGesture(minimumDistance: 4, coordinateSpace: .named("chain"))
+                                    .onChanged { value in
+                                        if dragging == nil { audio.selectedModule = module.id }
+                                        dragging = module.id
+                                        dragOffset = value.translation.height
+                                    }
+                                    .onEnded { _ in
+                                        let to = target(from: index)
+                                        withAnimation(T.quick) {
+                                            if to != index { audio.moveModule(from: IndexSet(integer: index), to: to > index ? to + 1 : to) }
+                                            dragging = nil
+                                            dragOffset = 0
+                                        }
+                                    }
+                            )
+                            .animation(dragging == module.id ? nil : T.quick, value: displacement(of: index))
                     }
-                } label: {
-                    Image(systemName: "plus").font(.system(size: 11, weight: .semibold)).foregroundStyle(.secondary)
-                        .frame(width: 26, height: 26)
-                        .background(Circle().fill(T.card))
-                        .overlay(Circle().strokeBorder(T.hairline, lineWidth: 0.5))
+                    if audio.rack.modules.isEmpty {
+                        Text("Empty chain").font(m.monoSmall).foregroundStyle(.tertiary)
+                            .frame(maxWidth: .infinity, alignment: .leading).padding(.horizontal, 8).padding(.vertical, 6)
+                    }
                 }
-                .menuStyle(.borderlessButton).menuIndicator(.hidden).frame(width: 30)
-                }
-                .padding(.leading, (audio.routes.isEmpty && !audio.virtualMicInstalled) ? m.gutter : 4).padding(.trailing, m.gutter)
+                .padding(.horizontal, m.gutter - 4)
+                .coordinateSpace(name: "chain")
                 .animation(T.quick, value: audio.rack.modules.map(\.id))
             }
+
+            Menu {
+                ForEach(["Tone", "Character", "Dynamics", "Space"], id: \.self) { group in
+                    Section(group) {
+                        ForEach(ModuleKind.allCases.filter { $0.group == group }) { kind in
+                            Button { audio.addModule(kind) } label: { Label(kind.title, systemImage: kind.symbol) }
+                        }
+                    }
+                }
+            } label: {
+                HStack(spacing: 6) {
+                    Image(systemName: "plus").font(.system(size: 10, weight: .semibold))
+                    Text("Add").font(.system(size: 11.5, weight: .medium))
+                }
+                .foregroundStyle(.secondary)
+                .frame(maxWidth: .infinity)
+                .frame(height: m.chainRowH)
+                .background(RoundedRectangle(cornerRadius: 7).fill(T.card))
+                .overlay(RoundedRectangle(cornerRadius: 7).strokeBorder(T.hairline, lineWidth: 0.5))
+            }
+            .menuStyle(.borderlessButton).menuIndicator(.hidden)
+            .padding(.horizontal, m.gutter - 4).padding(.top, m.gap).padding(.bottom, m.sectionTop)
         }
-        .padding(.vertical, m.rowV + 4)
     }
 }
 
-struct ChainChip: View {
+struct ChainRow: View {
     let module: RackModule
     let selected: Bool
+    let lifted: Bool
     let select: () -> Void
     let toggle: () -> Void
     @State private var hover = false
 
     var body: some View {
-        HStack(spacing: 6) {
+        HStack(spacing: 7) {
             Button(action: toggle) {
                 Circle().fill(module.enabled ? T.accent : Color.primary.opacity(0.18)).frame(width: 6, height: 6)
-                    .frame(width: 12, height: 12).contentShape(Rectangle())
+                    .frame(width: 14, height: 14).contentShape(Rectangle())
             }
             .buttonStyle(.plain)
+            .help(module.enabled ? "Bypass this module" : "Enable this module")
             Image(systemName: module.kind.symbol).font(.system(size: 10)).foregroundStyle(selected ? .primary : .secondary)
+                .frame(width: 14)
             Text(module.title).font(.system(size: 11.5, weight: selected ? .semibold : .medium)).lineLimit(1)
                 .foregroundStyle(module.enabled ? .primary : .secondary)
+            Spacer(minLength: 0)
         }
-        .padding(.leading, 8).padding(.trailing, 11).padding(.vertical, 5)
-        .background(Capsule().fill(selected ? T.press : (hover ? T.hover : T.card)))
-        .overlay(Capsule().strokeBorder(selected ? T.accent.opacity(0.5) : T.hairline, lineWidth: 0.5))
-        .contentShape(Capsule())
+        .padding(.horizontal, 8)
+        .frame(maxHeight: .infinity)
+        .background(RoundedRectangle(cornerRadius: 7).fill(selected ? T.press : (hover ? T.hover : T.card)))
+        .overlay(RoundedRectangle(cornerRadius: 7).strokeBorder(selected ? T.accent.opacity(0.5) : T.hairline, lineWidth: 0.5))
+        .shadow(color: .black.opacity(lifted ? 0.28 : 0), radius: lifted ? 10 : 0, y: lifted ? 4 : 0)
+        .scaleEffect(lifted ? 1.03 : 1)
+        .contentShape(Rectangle())
         .onTapGesture(perform: select)
         .onHover { hover = $0 }
         .animation(T.hoverAnim, value: hover)
         .animation(T.quick, value: selected)
+        .animation(T.quick, value: lifted)
     }
 }
 
@@ -1096,12 +1173,10 @@ struct ModuleEditor: View {
                 HStack(spacing: 8) {
                     Image(systemName: module.kind.symbol).font(.system(size: 12)).foregroundStyle(T.accent)
                     Text(module.title).font(.system(size: 13, weight: .semibold)).lineLimit(1)
-                    if module.name != nil { Text(module.kind.title).font(m.monoSmall).foregroundStyle(.tertiary) }
-                    Spacer()
-                    IconButton("chevron.up") { audio.moveModule(module.id, by: -1) }
-                    IconButton("chevron.down") { audio.moveModule(module.id, by: 1) }
-                    IconButton("arrow.counterclockwise") { audio.resetModule(module.id) }
-                    IconButton("trash") { audio.removeModule(module.id) }
+                    if module.name != nil { Text(module.kind.title).font(m.monoSmall).foregroundStyle(.tertiary).lineLimit(1).fixedSize() }
+                    Spacer(minLength: 4)
+                    IconButton("arrow.counterclockwise") { audio.resetModule(module.id) }.help("Reset module")
+                    IconButton("trash") { audio.removeModule(module.id) }.help("Remove module")
                 }
                 .padding(.horizontal, m.gutter).padding(.top, m.sectionTop).padding(.bottom, m.gap)
 
@@ -1282,7 +1357,10 @@ struct BandColumns: View {
     let setGain: (UUID, Double) -> Void
 
     var body: some View {
-        let dense = bands.count > 14
+        // Each column needs ~34 pt for its labels; past what the editor column can hold,
+        // switch to fixed-width columns that scroll sideways.
+        let available = m.width - m.chainW - 2 * m.gutter - 12
+        let dense = CGFloat(bands.count) * 34 > available
         let columns = HStack(alignment: .bottom, spacing: dense ? 4 : 6) {
             ForEach(bands) { band in
                 BandColumn(band: band, selected: band.id == selected, height: height,
@@ -1339,21 +1417,26 @@ struct BandDetail: View {
     let remove: () -> Void
 
     var body: some View {
-        HStack(spacing: 10) {
-            Button(action: toggle) {
-                Circle().fill(band.enabled ? T.accent : Color.primary.opacity(0.18)).frame(width: 7, height: 7).frame(width: 14, height: 14).contentShape(Rectangle())
-            }.buttonStyle(.plain).help(band.enabled ? "Disable filter" : "Enable filter")
-            Picker("", selection: Binding(get: { band.type }, set: setType)) {
-                ForEach(FilterType.allCases) { Text($0.rawValue).tag($0) }
+        VStack(spacing: 6) {
+            HStack(spacing: 8) {
+                Button(action: toggle) {
+                    Circle().fill(band.enabled ? T.accent : Color.primary.opacity(0.18)).frame(width: 7, height: 7).frame(width: 14, height: 14).contentShape(Rectangle())
+                }.buttonStyle(.plain).help(band.enabled ? "Disable filter" : "Enable filter")
+                Picker("", selection: Binding(get: { band.type }, set: setType)) {
+                    ForEach(FilterType.allCases) { Text($0.rawValue).tag($0) }
+                }
+                .labelsHidden().controlSize(.small).frame(width: 92)
+                Spacer(minLength: 4)
+                Text(band.frequency >= 1000 ? String(format: "%.2f kHz", band.frequency / 1000) : String(format: "%.0f Hz", band.frequency))
+                    .font(m.mono).foregroundStyle(.secondary).lineLimit(1)
+                Text(String(format: "Q %.2f", band.q)).font(m.mono).foregroundStyle(.secondary).lineLimit(1)
+                IconButton("xmark") { remove() }.help("Remove filter")
             }
-            .labelsHidden().controlSize(.small).frame(width: 92)
-            Fader(value: band.frequency, range: 20...20_000, log: true, set: setFreq)
-            Text(band.frequency >= 1000 ? String(format: "%.2fk", band.frequency / 1000) : String(format: "%.0f", band.frequency))
-                .font(m.mono).foregroundStyle(.secondary).frame(width: 46, alignment: .trailing)
-            Text("Q").font(m.monoSmall).foregroundStyle(.tertiary)
-            Fader(value: band.q, range: 0.1...12, log: true, set: setQ).frame(width: m.subtitle ? 80 : 56)
-            Text(String(format: "%.2f", band.q)).font(m.mono).foregroundStyle(.secondary).frame(width: 34, alignment: .trailing)
-            IconButton("xmark") { remove() }.help("Remove filter")
+            HStack(spacing: 8) {
+                Fader(value: band.frequency, range: 20...20_000, log: true, set: setFreq)
+                Text("Q").font(m.monoSmall).foregroundStyle(.tertiary)
+                Fader(value: band.q, range: 0.1...12, log: true, set: setQ).frame(width: m.subtitle ? 80 : 56)
+            }
         }
         .padding(.vertical, m.bandV).padding(.horizontal, 8)
         .background(RoundedRectangle(cornerRadius: 8).fill(T.card))

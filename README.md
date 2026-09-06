@@ -1,4 +1,4 @@
-# patchbay
+# patchbay.
 
 A native, open-source DSP rack and per-app router for macOS system audio. No virtual audio driver for output; an optional one for the microphone.
 
@@ -42,15 +42,18 @@ opens and closes without animation; in-app motion is short springs.
   rebuilt on a tab switch. *Compact*, *Comfortable* and *Spacious* pin one
   density everywhere.
 - **Settings** live behind the gear in the footer: appearance (system, dark,
-  light — applied to the popover itself), layout, accent colour, and audio
-  capture topology.
-- The chain is a strip of chips above the module editor in signal order,
-  first stage on the left. Click to edit, drag to reorder, dot to bypass one
-  module.
+  light — applied to the popover itself), layout, window behaviour (close on a
+  click elsewhere, or stay until the menu bar icon is clicked again), accent
+  colour, audio capture topology, and the virtual microphone driver.
+- The chain is a vertical stack beside the module editor in signal order, first
+  stage on top. Click a row to edit it, press and drag to reorder (the row
+  follows the pointer, the others slide out of its way), dot to bypass one
+  module. The icon beside the name in the header is the chain being edited:
+  waveform for the system chain, branch for a route, mic for the microphone.
 - **Parametric EQ** is a row of vertical gain faders, one per filter, low to
-  high frequency. Tap a column to edit its type, frequency and Q in the row
-  below; the currently selected column is highlighted. Past 14 filters the row
-  scrolls sideways.
+  high frequency. Tap a column to edit its type, frequency and Q in the rows
+  below; the currently selected column is highlighted. Once the columns no
+  longer fit the editor, the row scrolls sideways.
 - **Graph** (the pulse button in the rack footer) toggles a panel showing the
   combined frequency response of every enabled linear module (EQs, filters,
   loudness, gain) as a solid curve, the selected module's own curve dashed
@@ -60,7 +63,7 @@ opens and closes without animation; in-app motion is short springs.
 - **Routes** lists each app → device pair with a live status dot (waiting for
   the app, processing, error). The `+` menu offers every app currently
   connected to Core Audio. The sliders button on a row opens that route's chain
-  in the rack; a scope chip at the start of the chain strip switches between
+  in the rack; a scope chip at the top of the chain column switches between
   the system chain and each route. The header switch and footer status refer
   to the route being edited only while the rack page is in front.
 
