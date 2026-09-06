@@ -1068,15 +1068,12 @@ final class Bar: NSObject, NSPopoverDelegate {
     private func watchOutside() {
         stopWatchingOutside()
         monitor = NSEvent.addGlobalMonitorForEvents(matching: [.leftMouseDown, .rightMouseDown]) { [weak self] _ in self?.hide() }
-        if let window = pop.contentViewController?.view.window {
-            resignObserver = NotificationCenter.default.addObserver(forName: NSWindow.didResignKeyNotification, object: window, queue: .main) { [weak self] _ in
-                // Our own menus and the settings popout take key briefly; those leave a key
-                // window of ours behind. Focus going to another app leaves none.
-                DispatchQueue.main.async {
-                    guard let self, self.pop.isShown, !Theme.shared.keepOpen, NSApp.keyWindow == nil else { return }
-                    self.hide()
-                }
-            }
+        // Whatever the user clicked on, if it was not ours the app deactivates. That covers the
+        // cases a mouse monitor never sees: menu bar extras, menu tracking, and a click that
+        // AppKit swallows to dismiss the settings popout.
+        resignObserver = NotificationCenter.default.addObserver(forName: NSApplication.didResignActiveNotification, object: nil, queue: .main) { [weak self] _ in
+            guard let self, self.pop.isShown, !Theme.shared.keepOpen else { return }
+            self.hide()
         }
     }
 
@@ -1086,7 +1083,8 @@ final class Bar: NSObject, NSPopoverDelegate {
     }
 
     private func hide() {
-        pop.performClose(nil)
+        // Not performClose: AppKit declines that while a child popover (settings) is attached.
+        pop.close()
         stopWatchingOutside()
     }
 

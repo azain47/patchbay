@@ -327,12 +327,9 @@ struct SettingsPopout: View {
                 }
             }
             SettingGroup("Window") {
-                Toggle(isOn: $theme.keepOpen) {
-                    Text("Stay open until the menu bar icon is clicked again").font(.system(size: 11))
-                }
-                .toggleStyle(.switch).controlSize(.mini).tint(T.accent)
-                Text(theme.keepOpen ? "Clicks elsewhere leave the window up." : "A click anywhere else closes the window.")
-                    .font(.system(size: 10.5)).foregroundStyle(.tertiary).fixedSize(horizontal: false, vertical: true)
+                Toggle(isOn: $theme.keepOpen) { Text("Stay open").font(.system(size: 11)) }
+                    .toggleStyle(.switch).controlSize(.mini).tint(T.accent)
+                    .help("Off: a click anywhere else closes the window. On: it stays until the menu bar icon is clicked again.")
             }
             SettingGroup("Accent") {
                 HStack(spacing: 8) {
