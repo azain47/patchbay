@@ -314,6 +314,9 @@ struct RackSettings: Codable, Equatable {
     var enabled = false
     var bypass = false
     var modules: [RackModule] = [RackModule(kind: .parametricEQ), RackModule(kind: .limiter)]
+    /// The preset this chain was loaded from, if any. Edits keep the link; the UI shows
+    /// the chain as modified until the preset is updated or another one is applied.
+    var preset: UUID?
 
     static let neutral = RackSettings()
 
@@ -336,10 +339,36 @@ final class RackSettingsStore {
     }
 
     func settings(for deviceUID: String) -> RackSettings { values[deviceUID] ?? .neutral }
+    func has(_ deviceUID: String) -> Bool { values[deviceUID] != nil }
 
     func save(_ settings: RackSettings, for deviceUID: String) {
         values[deviceUID] = settings
         guard let data = try? JSONEncoder().encode(values) else { return }
+        UserDefaults.standard.set(data, forKey: key)
+    }
+}
+
+// MARK: - Presets
+
+/// A named snapshot of a chain. `device` is the output it was saved for: an output that
+/// shows up with no chain of its own starts from the preset remembered for its name.
+struct Preset: Codable, Identifiable, Equatable {
+    var id = UUID()
+    var name: String
+    var device: String?
+    var modules: [RackModule]
+}
+
+final class PresetStore {
+    private let key = "presets.v1"
+
+    func load() -> [Preset] {
+        guard let data = UserDefaults.standard.data(forKey: key), let decoded = try? JSONDecoder().decode([Preset].self, from: data) else { return [] }
+        return decoded
+    }
+
+    func save(_ presets: [Preset]) {
+        guard let data = try? JSONEncoder().encode(presets) else { return }
         UserDefaults.standard.set(data, forKey: key)
     }
 }

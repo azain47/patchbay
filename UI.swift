@@ -1105,12 +1105,107 @@ struct RackTab: View {
             }
             .padding(.horizontal, m.gutter).padding(.vertical, m.rowV + 3)
         }
+        .presetPrompt(audio: audio)
     }
 
     private func rateLabel(_ r: Double) -> String {
         r >= 1000 ? String(format: r.truncatingRemainder(dividingBy: 1000) == 0 ? "%.0f kHz" : "%.1f kHz", r / 1000) : "—"
     }
 }
+
+// MARK: - Presets
+
+/// Which preset the chain came from, with a dot once it has been edited past it.
+struct PresetChip: View {
+    @ObservedObject var audio: AudioState
+
+    var body: some View {
+        Chip {
+            Menu { PresetMenuItems(audio: audio) } label: {
+                HStack(spacing: 5) {
+                    Image(systemName: "bookmark").font(.system(size: 10))
+                    Text(audio.currentPreset?.name ?? "Preset").font(.system(size: 11, weight: .medium)).lineLimit(1)
+                    if audio.presetModified {
+                        Image(systemName: "circle.fill").font(.system(size: 5)).foregroundStyle(T.accent)
+                    }
+                }
+                .foregroundStyle(audio.currentPreset == nil ? .secondary : .primary)
+            }
+            .menuStyle(.borderlessButton).menuIndicator(.visible)
+        }
+        .help(audio.presetModified ? "Chain edited since the preset was applied" : "Presets: named chains you can recall on any device")
+    }
+}
+
+struct PresetMenuItems: View {
+    @ObservedObject var audio: AudioState
+
+    var body: some View {
+        if audio.presets.isEmpty {
+            Text("No presets yet")
+        }
+        ForEach(audio.presets) { preset in
+            Button { audio.applyPreset(preset) } label: {
+                HStack {
+                    Text(preset.device.map { "\(preset.name) · \($0)" } ?? preset.name)
+                    if preset.id == audio.rack.preset { Image(systemName: audio.presetModified ? "circle.fill" : "checkmark") }
+                }
+            }
+        }
+        Divider()
+        Button("Save as preset…") { audio.presetPrompt = .save }
+        if let current = audio.currentPreset {
+            Button("Update “\(current.name)”") { audio.updatePreset() }.disabled(!audio.presetModified)
+            Button("Rename…") { audio.presetPrompt = .rename(current.id) }
+            if let device = audio.rackTarget?.name, audio.rackScope == .system {
+                Button {
+                    audio.rememberPreset(current.id, forDevice: current.device != device)
+                } label: {
+                    HStack { Text("Auto-select for \(device)"); if current.device == device { Image(systemName: "checkmark") } }
+                }
+            }
+            Button("Delete “\(current.name)”", role: .destructive) { audio.deletePreset(current.id) }
+        }
+    }
+}
+
+/// The name sheet for saving or renaming a preset, hung off the rack page.
+struct PresetNameSheet: ViewModifier {
+    @ObservedObject var audio: AudioState
+    @State private var name = ""
+
+    func body(content: Content) -> some View {
+        content
+            .alert(title, isPresented: Binding(get: { audio.presetPrompt != nil }, set: { if !$0 { audio.presetPrompt = nil } })) {
+                TextField("Name", text: $name)
+                Button("Cancel", role: .cancel) { audio.presetPrompt = nil }
+                Button(isRename ? "Rename" : "Save") {
+                    switch audio.presetPrompt {
+                    case .save: audio.savePreset(named: name)
+                    case .rename(let id): audio.renamePreset(id, to: name)
+                    case nil: break
+                    }
+                    audio.presetPrompt = nil
+                }
+                .disabled(name.trimmingCharacters(in: .whitespaces).isEmpty)
+            } message: {
+                if case .save = audio.presetPrompt, audio.rackScope == .system, let device = audio.rackTarget?.name {
+                    Text("Saves the chain as it is now and remembers it for \(device).")
+                }
+            }
+            .onChange(of: audio.presetPrompt) { _, prompt in
+                switch prompt {
+                case .save: name = audio.rackScope == .system ? (audio.rackTarget?.name ?? "") : ""
+                case .rename(let id): name = audio.presets.first { $0.id == id }?.name ?? ""
+                case nil: break
+                }
+            }
+    }
+
+    private var isRename: Bool { if case .rename = audio.presetPrompt { true } else { false } }
+    private var title: String { isRename ? "Rename preset" : "Save preset" }
+}
+extension View { func presetPrompt(audio: AudioState) -> some View { modifier(PresetNameSheet(audio: audio)) } }
 
 /// The signal chain as a vertical stack in processing order, first stage on top. Press and
 /// drag a row to reorder: it follows the pointer, the others slide out of its way, release
@@ -1181,6 +1276,7 @@ struct ChainColumn: View {
             } else {
                 SectionLabel(text: "Chain").padding(.horizontal, m.gutter - 4).padding(.top, m.sectionTop).padding(.bottom, m.gap)
             }
+            PresetChip(audio: audio).padding(.horizontal, m.gutter - 4).padding(.bottom, m.gap)
 
             ScrollView(showsIndicators: false) {
                 VStack(spacing: 4) {
@@ -1319,6 +1415,7 @@ struct ModuleEditor: View {
                                         }
                                     }
                                 }
+                                Menu(audio.currentPreset.map { "Preset · \($0.name)" } ?? "Presets") { PresetMenuItems(audio: audio) }
                             } label: {
                                 HStack(spacing: 6) {
                                     Image(systemName: module.kind.symbol).font(.system(size: 12)).foregroundStyle(T.accent)
@@ -1465,9 +1562,10 @@ struct ParametricEditor: View {
         VStack(alignment: .leading, spacing: m.gap) {
             HStack(spacing: 8) {
                 HStack(spacing: 6) {
-                    Image(systemName: "magnifyingglass").font(.system(size: 10)).foregroundStyle(.tertiary)
-                    TextField("AutoEq headphone…", text: $query).textFieldStyle(.plain).font(.system(size: 12))
-                        .onChange(of: query) { _, q in if !q.isEmpty { audio.autoEQ.load() } }
+                    Image(systemName: audio.importing ? "arrow.down.circle" : "magnifyingglass").font(.system(size: 10)).foregroundStyle(.tertiary)
+                    TextField(audio.profileSource == .autoEQ ? "AutoEq headphone…" : "\(audio.squig.database?.siteName ?? "squig.link") phone…", text: $query)
+                        .textFieldStyle(.plain).font(.system(size: 12))
+                        .onChange(of: query) { _, q in if !q.isEmpty { loadCatalog() } }
                 }
                 .padding(.horizontal, 9).padding(.vertical, 6)
                 .background(RoundedRectangle(cornerRadius: 7).fill(T.card))
@@ -1475,8 +1573,12 @@ struct ParametricEditor: View {
                 IconButton("square.and.arrow.down") { audio.importParametricFile() }.help("Import ParametricEQ.txt")
                 IconButton("square.and.arrow.up") { audio.exportParametricFile(module.id) }.help("Export ParametricEQ.txt")
             }
+            ProfileChips(audio: audio)
             if !query.isEmpty {
-                AutoEQResults(audio: audio, query: query) { query = "" }
+                switch audio.profileSource {
+                case .autoEQ: AutoEQResults(audio: audio, query: query) { query = "" }
+                case .squig: SquigResults(audio: audio, query: query) { query = "" }
+                }
             }
 
             BandColumns(bands: bands, selected: current?.id, height: m.faderH,
@@ -1501,6 +1603,13 @@ struct ParametricEditor: View {
         }
         .animation(T.quick, value: module.bands.map(\.id))
         .animation(T.quick, value: selectedBand)
+    }
+
+    private func loadCatalog() {
+        switch audio.profileSource {
+        case .autoEQ: audio.autoEQ.load()
+        case .squig: audio.squig.load()
+        }
     }
 }
 
@@ -1647,6 +1756,136 @@ struct AutoEQResults: View {
                         .padding(4)
                     }
                     .frame(maxHeight: 180)
+                }
+            }
+        }
+        .background(RoundedRectangle(cornerRadius: 8).fill(T.card))
+        .overlay(RoundedRectangle(cornerRadius: 8).strokeBorder(T.hairline, lineWidth: 0.5))
+    }
+}
+
+/// A small rounded control surface for a hugging Menu.
+struct Chip<Content: View>: View {
+    @ViewBuilder var content: Content
+    var body: some View {
+        Hug { content }
+            .padding(.leading, 8).padding(.trailing, 2).padding(.vertical, 3)
+            .background(Capsule().fill(T.card))
+            .overlay(Capsule().strokeBorder(T.hairline, lineWidth: 0.5))
+    }
+}
+
+/// Source, filter count and (for squig.link) target for the profile search.
+struct ProfileChips: View {
+    @ObservedObject var audio: AudioState
+    @ObservedObject private var squig: SquigCatalog
+
+    init(audio: AudioState) { self.audio = audio; self.squig = audio.squig }
+
+    var body: some View {
+        HStack(spacing: 6) {
+            Chip {
+                Menu {
+                    Button { audio.profileSource = .autoEQ } label: {
+                        HStack { Text("AutoEq"); if audio.profileSource == .autoEQ { Image(systemName: "checkmark") } }
+                    }
+                    Menu("squig.link") {
+                        if squig.databases.isEmpty {
+                            Text("Loading sites…")
+                        }
+                        ForEach(squig.databases) { db in
+                            Button { audio.profileSource = .squig; squig.select(db) } label: {
+                                HStack { Text(db.title); if audio.profileSource == .squig, db == squig.database { Image(systemName: "checkmark") } }
+                            }
+                        }
+                    }
+                } label: {
+                    Text(sourceTitle).font(.system(size: 11)).lineLimit(1)
+                }
+                .menuStyle(.borderlessButton).menuIndicator(.visible)
+                .onAppear {
+                    squig.loadSites()
+                    if audio.profileSource == .squig { squig.load() }
+                }
+            }
+            .help("Where profiles come from: AutoEq's index or a reviewer's measurements on squig.link")
+            Chip {
+                Menu {
+                    ForEach(AudioState.importBandChoices, id: \.self) { n in
+                        Button { audio.importBands = n } label: { HStack { Text("\(n) filters"); if n == audio.importBands { Image(systemName: "checkmark") } } }
+                    }
+                } label: { Text("\(audio.importBands) filters").font(.system(size: 11)) }
+                .menuStyle(.borderlessButton).menuIndicator(.visible)
+            }
+            .help("Filters to fit. AutoEq's own result is used at 10; other counts are fitted from the full-resolution correction.")
+            if audio.profileSource == .squig, !squig.targets.isEmpty {
+                Chip {
+                    Menu {
+                        ForEach(squig.targets) { t in
+                            Button { squig.setTarget(t) } label: { HStack { Text(t.name); if t == squig.target { Image(systemName: "checkmark") } } }
+                        }
+                    } label: { Text(squig.target?.name ?? "Target").font(.system(size: 11)).lineLimit(1) }
+                    .menuStyle(.borderlessButton).menuIndicator(.visible)
+                }
+                .help("Target curve the measurement is corrected towards")
+            }
+        }
+        .frame(maxWidth: .infinity, alignment: .leading)
+    }
+
+    private var sourceTitle: String {
+        switch audio.profileSource {
+        case .autoEQ: "AutoEq"
+        case .squig: squig.database?.title ?? "squig.link"
+        }
+    }
+}
+
+struct SquigResults: View {
+    @Environment(\.metrics) private var m
+    @ObservedObject var audio: AudioState
+    let query: String
+    let done: () -> Void
+    @ObservedObject private var catalog: SquigCatalog
+
+    init(audio: AudioState, query: String, done: @escaping () -> Void) {
+        self.audio = audio; self.query = query; self.done = done; self.catalog = audio.squig
+    }
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 0) {
+            if catalog.database == nil {
+                Text("Pick a squig.link database first").font(m.mono).foregroundStyle(.tertiary).padding(10)
+            } else {
+                switch catalog.state {
+                case .loading: Text("Loading measurements…").font(m.mono).foregroundStyle(.tertiary).padding(10)
+                case .failed(let e): Text("Database unavailable: \(e)").font(m.mono).foregroundStyle(T.warn).padding(10)
+                case .idle: EmptyView()
+                case .ready:
+                    let results = catalog.search(query)
+                    if results.isEmpty {
+                        Text("No matches").font(m.mono).foregroundStyle(.tertiary).padding(10)
+                    } else {
+                        ScrollView {
+                            VStack(spacing: 1) {
+                                ForEach(results) { e in
+                                    Button { audio.applySquig(e); done() } label: {
+                                        HStack {
+                                            VStack(alignment: .leading, spacing: 2) {
+                                                Text(e.title).font(.system(size: 12)).lineLimit(1)
+                                                Text(catalog.database?.title ?? "").font(m.monoSmall).foregroundStyle(.tertiary)
+                                            }
+                                            Spacer()
+                                        }
+                                        .padding(.horizontal, 9).padding(.vertical, 5).contentShape(Rectangle())
+                                    }
+                                    .buttonStyle(Press()).hoverRow(6)
+                                }
+                            }
+                            .padding(4)
+                        }
+                        .frame(maxHeight: 180)
+                    }
                 }
             }
         }

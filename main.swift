@@ -329,6 +329,30 @@ final class AudioState: ObservableObject {
     private var noticeExpiry: DispatchWorkItem?
 
     let autoEQ = AutoEQCatalog()
+    let squig = SquigCatalog()
+    /// Where the rack page's search looks: AutoEq's index or a squig.link database.
+    enum ProfileSource: Equatable { case autoEQ, squig }
+    @Published var profileSource: ProfileSource = UserDefaults.standard.bool(forKey: "profileSourceSquig") ? .squig : .autoEQ {
+        didSet { UserDefaults.standard.set(profileSource == .squig, forKey: "profileSourceSquig") }
+    }
+    /// Filters to fit when importing a correction. AutoEq's own ten-filter result is used
+    /// verbatim at 10; anything else is fitted here from the full-resolution curve.
+    @Published var importBands: Int = { let v = UserDefaults.standard.integer(forKey: "importBands"); return v == 0 ? 10 : v }() {
+        didSet { UserDefaults.standard.set(importBands, forKey: "importBands") }
+    }
+    static let importBandChoices = [5, 8, 10, 12, 16, 20, 24, 32]
+    @Published var importing = false
+
+    // Presets: named chain snapshots, each optionally remembered for an output device.
+    @Published private(set) var presets: [Preset]
+    private let presetStore = PresetStore()
+    enum PresetPrompt: Identifiable, Equatable {
+        case save, rename(UUID)
+        var id: String { switch self { case .save: "save"; case .rename(let id): id.uuidString } }
+    }
+    @Published var presetPrompt: PresetPrompt?
+    var currentPreset: Preset? { rack.preset.flatMap { id in presets.first { $0.id == id } } }
+    var presetModified: Bool { currentPreset.map { $0.modules != rack.modules } ?? false }
 
     var currentOutput: Device? { outputs.first { $0.isDefault } }
     var currentInput: Device? { inputs.first { $0.isDefault } }
@@ -350,6 +374,7 @@ final class AudioState: ObservableObject {
     var onHealth: ((Bool) -> Void)?
 
     init() {
+        presets = presetStore.load()
         engine.tapMode = tapMode
         engine.onStatus = { [weak self] status in
             self?.rackStatus = status
@@ -497,6 +522,14 @@ final class AudioState: ObservableObject {
         }
         if rackDeviceUID != target.uid {
             rackDeviceUID = target.uid
+            // An output seen for the first time starts from the preset remembered for its name.
+            if !rackStore.has(target.uid), let preset = presets.first(where: { $0.device == target.name }) {
+                var seeded = RackSettings.neutral
+                seeded.modules = preset.modules
+                seeded.preset = preset.id
+                rackStore.save(seeded, for: target.uid)
+                notice = "\(target.name): preset “\(preset.name)”"
+            }
             if rackScope == .system {
                 var loaded = rackStore.settings(for: target.uid)
                 loaded.enabled = rackOn
@@ -870,9 +903,54 @@ final class AudioState: ObservableObject {
         scopedEngine?.publish(rack)
     }
 
-    // MARK: Presets, import, export
+    // MARK: Presets
 
-    func applyPreset(_ preset: ParametricPreset, name: String, replacing id: UUID? = nil) {
+    func applyPreset(_ preset: Preset) {
+        update { $0.modules = preset.modules; $0.preset = preset.id }
+        selectedModule = rack.modules.first?.id
+    }
+
+    /// Snapshots the chain being edited. Saved from the system chain it is remembered for
+    /// the current output, so the same headphones pick it up on another Mac profile or
+    /// after a reset.
+    func savePreset(named name: String) {
+        let trimmed = name.trimmingCharacters(in: .whitespaces)
+        guard !trimmed.isEmpty else { return }
+        let preset = Preset(name: trimmed, device: rackScope == .system ? rackTarget?.name : nil, modules: rack.modules)
+        presets.append(preset)
+        presetStore.save(presets)
+        update { $0.preset = preset.id }
+    }
+
+    func updatePreset() {
+        guard let i = presets.firstIndex(where: { $0.id == rack.preset }) else { return }
+        presets[i].modules = rack.modules
+        presetStore.save(presets)
+    }
+
+    func renamePreset(_ id: UUID, to name: String) {
+        let trimmed = name.trimmingCharacters(in: .whitespaces)
+        guard !trimmed.isEmpty, let i = presets.firstIndex(where: { $0.id == id }) else { return }
+        presets[i].name = trimmed
+        presetStore.save(presets)
+    }
+
+    func deletePreset(_ id: UUID) {
+        presets.removeAll { $0.id == id }
+        presetStore.save(presets)
+        if rack.preset == id { update { $0.preset = nil } }
+    }
+
+    /// Remember (or forget) the preset for the output the rack currently targets.
+    func rememberPreset(_ id: UUID, forDevice remember: Bool) {
+        guard let i = presets.firstIndex(where: { $0.id == id }) else { return }
+        presets[i].device = remember ? rackTarget?.name : nil
+        presetStore.save(presets)
+    }
+
+    // MARK: Correction profiles, import, export
+
+    func applyParametric(_ preset: ParametricPreset, name: String, replacing id: UUID? = nil) {
         var module = RackModule(kind: .parametricEQ, name: name)
         module.params["preamp"] = preset.preampDB
         module.bands = preset.bands
@@ -892,7 +970,7 @@ final class AudioState: ObservableObject {
         panel.message = "Choose an Equalizer APO / AutoEq ParametricEQ.txt"
         guard panel.runModal() == .OK, let url = panel.url, let text = try? String(contentsOf: url, encoding: .utf8) else { return }
         guard let preset = ParametricPreset.parse(text) else { notice = "No filters found in that file."; return }
-        applyPreset(preset, name: url.deletingPathExtension().lastPathComponent, replacing: selected?.kind == .parametricEQ ? selected?.id : nil)
+        applyParametric(preset, name: url.deletingPathExtension().lastPathComponent, replacing: selected?.kind == .parametricEQ ? selected?.id : nil)
     }
 
     func exportParametricFile(_ id: UUID) {
@@ -905,17 +983,54 @@ final class AudioState: ObservableObject {
         try? preset.exportText.write(to: url, atomically: true, encoding: .utf8)
     }
 
-    func applyAutoEQ(_ entry: AutoEQCatalog.Entry) {
-        autoEQ.fetchProfile(entry) { [weak self] result in
-            guard let self else { return }
-            switch result {
-            case .success(let preset):
-                let existing = self.rack.modules.first { $0.name?.hasPrefix("AutoEq") == true }
-                self.applyPreset(preset, name: "AutoEq · \(entry.name)", replacing: existing?.id)
-            case .failure(let error):
-                self.notice = "Could not fetch profile: \(error.localizedDescription)"
+    /// A downloaded profile replaces the chain's existing profile module (whatever source it
+    /// came from) so switching headphones never stacks corrections.
+    private func applyProfile(_ preset: ParametricPreset, name: String) {
+        let existing = rack.modules.first { $0.name?.hasPrefix("AutoEq") == true || $0.name?.hasPrefix("squig") == true }
+        applyParametric(preset, name: name, replacing: existing?.id)
+    }
+
+    private func fitAndApply(_ result: Result<[(frequency: Double, gainDB: Double)], Error>, name: String, bands: Int) {
+        switch result {
+        case .success(let curve):
+            DispatchQueue.global(qos: .userInitiated).async { [weak self] in
+                let preset = EQFit.fit(curve, bands: bands)
+                DispatchQueue.main.async {
+                    guard let self else { return }
+                    self.importing = false
+                    guard !preset.bands.isEmpty else { self.notice = "Nothing to correct: that measurement already matches the target."; return }
+                    self.applyProfile(preset, name: name)
+                }
             }
+        case .failure(let error):
+            importing = false
+            notice = "Could not fetch profile: \(error.localizedDescription)"
         }
+    }
+
+    func applyAutoEQ(_ entry: AutoEQCatalog.Entry) {
+        importing = true
+        let name = "AutoEq · \(entry.name)"
+        if importBands == 10 {
+            autoEQ.fetchProfile(entry) { [weak self] result in
+                guard let self else { return }
+                importing = false
+                switch result {
+                case .success(let preset): applyProfile(preset, name: name)
+                case .failure(let error): notice = "Could not fetch profile: \(error.localizedDescription)"
+                }
+            }
+        } else {
+            let bands = importBands
+            autoEQ.fetchCorrection(entry) { [weak self] result in self?.fitAndApply(result, name: name, bands: bands) }
+        }
+    }
+
+    func applySquig(_ entry: SquigCatalog.Entry) {
+        importing = true
+        let bands = importBands
+        let name = "squig · \(squig.database?.siteName ?? "") · \(entry.title)"
+        squig.fetchCorrection(entry) { [weak self] result in self?.fitAndApply(result, name: name, bands: bands) }
     }
 
     // MARK: Internals

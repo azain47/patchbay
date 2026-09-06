@@ -101,4 +101,60 @@ final class AutoEQCatalog: ObservableObject {
             }
         }.resume()
     }
+
+    /// The full-resolution correction, for fitting a filter count other than the ten AutoEq
+    /// publishes: the `equalization` column of the result CSV where one is published, else
+    /// the 127-point `GraphicEQ.txt` every result has. The latter is shifted so its peak sits
+    /// at −0.2 dB, so it is re-anchored on its median over 100 Hz – 8 kHz, where a correction
+    /// mostly sits near zero; an offset only costs the fit a little shelf capacity anyway.
+    func fetchCorrection(_ entry: Entry, completion: @escaping (Result<[(frequency: Double, gainDB: Double)], Error>) -> Void) {
+        let file = entry.name.addingPercentEncoding(withAllowedCharacters: .urlPathAllowed) ?? entry.name
+        let folder = Self.base + entry.path + "/" + file
+        guard let csv = URL(string: folder + ".csv"), let graphic = URL(string: folder + "%20GraphicEQ.txt") else {
+            completion(.failure(URLError(.badURL))); return
+        }
+        URLSession.shared.dataTask(with: csv) { data, response, _ in
+            if let data, (response as? HTTPURLResponse)?.statusCode == 200, let text = String(data: data, encoding: .utf8) {
+                let curve = Self.parseCSV(text)
+                if curve.count > 20 { DispatchQueue.main.async { completion(.success(curve)) }; return }
+            }
+            URLSession.shared.dataTask(with: graphic) { data, response, error in
+                var curve: [(frequency: Double, gainDB: Double)] = []
+                if let data, (response as? HTTPURLResponse)?.statusCode == 200, let text = String(data: data, encoding: .utf8) {
+                    curve = Self.parseGraphic(text)
+                }
+                DispatchQueue.main.async {
+                    curve.count > 20 ? completion(.success(curve)) : completion(.failure(error ?? URLError(.badServerResponse)))
+                }
+            }.resume()
+        }.resume()
+    }
+
+    private static func parseCSV(_ text: String) -> [(frequency: Double, gainDB: Double)] {
+        var lines = text.split(whereSeparator: \.isNewline).makeIterator()
+        let header = lines.next()?.split(separator: ",").map { $0.trimmingCharacters(in: .whitespaces) } ?? []
+        guard let fi = header.firstIndex(of: "frequency"), let ei = header.firstIndex(of: "equalization") else { return [] }
+        var curve: [(frequency: Double, gainDB: Double)] = []
+        while let line = lines.next() {
+            let cols = line.split(separator: ",", omittingEmptySubsequences: false)
+            guard cols.count > max(fi, ei), let f = Double(cols[fi]), let g = Double(cols[ei]) else { continue }
+            curve.append((f, g))
+        }
+        return curve
+    }
+
+    /// `GraphicEQ: 20 -0.2; 21 -0.2; …`
+    private static func parseGraphic(_ text: String) -> [(frequency: Double, gainDB: Double)] {
+        guard let colon = text.firstIndex(of: ":") else { return [] }
+        var curve: [(frequency: Double, gainDB: Double)] = []
+        for pair in text[text.index(after: colon)...].split(separator: ";") {
+            let parts = pair.split(separator: " ").compactMap { Double($0) }
+            guard parts.count == 2 else { continue }
+            curve.append((parts[0], parts[1]))
+        }
+        let mid = curve.filter { $0.frequency >= 100 && $0.frequency <= 8_000 }.map(\.gainDB).sorted()
+        guard !mid.isEmpty else { return curve }
+        let anchor = mid[mid.count / 2]
+        return curve.map { ($0.frequency, $0.gainDB - anchor) }
+    }
 }

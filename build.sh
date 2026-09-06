@@ -35,6 +35,8 @@ swiftc \
     "$DIR/AutoEQ.swift" \
     "$DIR/Routing.swift" \
     "$DIR/MicEngine.swift" \
+    "$DIR/Squig.swift" \
+    "$DIR/EQFit.swift" \
     "$OBJ"
 
 cat > "$APP/Contents/Info.plist" << 'EOF'

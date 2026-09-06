@@ -20,9 +20,23 @@ A native, open-source DSP rack and per-app router for macOS system audio. No vir
   saturation → stereo/time effects → loudness → maximizer → limiter. Existing
   modules are never moved; drag if you want something else. A new EQ filter is
   inserted at the top of the list.
-- **AutoEq headphone correction**: search 8,800+ profiles from [jaakkopasanen/AutoEq](https://github.com/jaakkopasanen/AutoEq), applied as a parametric module in one click
+- **Headphone correction** from two sources, applied as a parametric module in
+  one click: 8,800+ profiles from [jaakkopasanen/AutoEq](https://github.com/jaakkopasanen/AutoEq)
+  (oratory1990, crinacle, Rtings, …), or any reviewer database on
+  [squig.link](https://squig.link) — pick the database and target curve, and
+  the correction is computed from the measurement on the spot. Hangout.Audio
+  (crinacle's own site) opted out of third-party access and is not offered;
+  his measurements reach the app through AutoEq.
+- **Any filter count**: AutoEq publishes ten filters per profile; ask for 5 to
+  32 and patchbay fits its own from the full-resolution correction (on the HD
+  650 the 10-filter fit lands within 0.25 dB RMS of the target, better than
+  the published ten; 16 filters halve that).
 - **Equalizer APO import/export**: `ParametricEQ.txt` in, `ParametricEQ.txt` out
 - **Per-device chains**: every output device remembers its own rack
+- **Presets**: save the chain under a name and recall it on any device, route
+  or the microphone. A preset saved from an output is remembered for it, so
+  the same headphones on a fresh profile (or a new pair with the same name)
+  start from that chain automatically.
 - **Bypass** for instant A/B, input/output metering, **device sample rate** picker in the rack footer
 - **Output and input device switching**, hardware volume, mic gain and hardware mic mute
 - **eqMac recovery** tools (fix stuck audio, restart, reset Core Audio) on the Fix page
@@ -52,6 +66,11 @@ opens and closes without animation; in-app motion is short springs.
   title then becomes the module picker, with *Add* inside it. The icon beside
   the name in the header is the chain being edited: waveform for the system
   chain, branch for a route, mic for the microphone.
+- The **preset chip** under the chain header shows which preset the chain came
+  from, with a dot once you have edited past it. Its menu applies a preset,
+  saves the chain as a new one, updates, renames or deletes the current one,
+  and toggles *Auto-select for <device>*. With the column hidden the same
+  items live in the module picker's *Preset* submenu.
 - **Sliders**: hold shift while dragging for fine control. The drag turns
   relative and slows to the *Shift step* set in Settings (½ to 1⁄50 of pointer
   travel), and a bubble on the knob shows the value being dialled. Applies to
@@ -59,7 +78,9 @@ opens and closes without animation; in-app motion is short springs.
 - **Parametric EQ** is a row of vertical gain faders, one per filter, low to
   high frequency. Tap a column to edit its type, frequency and Q in the rows
   below; the currently selected column is highlighted. Once the columns no
-  longer fit the editor, the row scrolls sideways.
+  longer fit the editor, the row scrolls sideways. The chips under the search
+  field pick the source (AutoEq or a squig.link database), the filter count,
+  and for squig.link the target curve to correct towards.
 - **Graph** (the pulse button in the rack footer) toggles a panel showing the
   combined frequency response of every enabled linear module (EQs, filters,
   loudness, gain) as a solid curve, the selected module's own curve dashed
