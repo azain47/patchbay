@@ -149,6 +149,20 @@ struct HoverRow: ViewModifier {
 }
 extension View { func hoverRow(_ radius: CGFloat = 8) -> some View { modifier(HoverRow(radius: radius)) } }
 
+/// Sizes its one child to its ideal width, capped at what the parent offers. A borderless
+/// Menu fills whatever it is proposed and, pinned with fixedSize, pushes the row wider
+/// than the window when its label is long; under Hug it hugs the label and truncates.
+struct Hug: Layout {
+    func sizeThatFits(proposal: ProposedViewSize, subviews: Subviews, cache: inout ()) -> CGSize {
+        guard let child = subviews.first else { return .zero }
+        let ideal = child.sizeThatFits(.unspecified)
+        return CGSize(width: min(ideal.width, proposal.width ?? ideal.width), height: ideal.height)
+    }
+    func placeSubviews(in bounds: CGRect, proposal: ProposedViewSize, subviews: Subviews, cache: inout ()) {
+        subviews.first?.place(at: bounds.origin, anchor: .topLeading, proposal: ProposedViewSize(bounds.size))
+    }
+}
+
 struct SectionLabel: View {
     @Environment(\.metrics) private var m
     let text: String
@@ -306,7 +320,7 @@ struct Footer: View {
 
     var body: some View {
         HStack(spacing: 10) {
-            Text(audio.scopeOn ? audio.scopeStatus.label : (audio.headerScope == .system ? "rack off" : "route off")).font(m.mono).foregroundStyle(.tertiary)
+            Text(audio.scopeOn ? audio.scopeStatus.label : (audio.headerScope == .system ? "rack off" : "route off")).font(m.mono).foregroundStyle(.tertiary).lineLimit(1)
             Spacer()
             Button { showSettings.toggle() } label: {
                 Image(systemName: "gearshape").font(.system(size: 11)).foregroundStyle(.secondary).frame(width: 24, height: 22)
@@ -675,26 +689,31 @@ struct RouteRow: View {
                 Text(route.name).font(m.nameStrong).lineLimit(1).foregroundStyle(route.enabled ? .primary : .secondary)
                 if m.subtitle { Text(route.enabled ? status.label : "off").font(m.monoSmall).foregroundStyle(.tertiary) }
             }
+            // Both texts outrank the spacer, so they split the row between them and
+            // truncate only once it is genuinely full.
+            .layoutPriority(1)
             Spacer(minLength: 6)
             Image(systemName: "arrow.right").font(.system(size: 9, weight: .semibold)).foregroundStyle(.quaternary)
-            Menu {
-                ForEach(audio.outputs.filter { !$0.isEqMac }) { d in
-                    Button { audio.setRoute(route.id, outputUID: d.uid) } label: {
-                        HStack { Text(d.name); if d.uid == route.outputUID { Image(systemName: "checkmark") } }
+            Hug {
+                Menu {
+                    ForEach(audio.outputs.filter { !$0.isEqMac }) { d in
+                        Button { audio.setRoute(route.id, outputUID: d.uid) } label: {
+                            HStack { Text(d.name); if d.uid == route.outputUID { Image(systemName: "checkmark") } }
+                        }
                     }
+                } label: {
+                    HStack(spacing: 5) {
+                        Image(systemName: device?.icon ?? "questionmark").font(.system(size: 10))
+                        Text(device?.name ?? "Not connected").font(m.name).lineLimit(1)
+                    }
+                    .foregroundStyle(device == nil ? T.warn : .primary)
                 }
-            } label: {
-                HStack(spacing: 5) {
-                    Image(systemName: device?.icon ?? "questionmark").font(.system(size: 10))
-                    Text(device?.name ?? "Not connected").font(m.name).lineLimit(1)
-                    Image(systemName: "chevron.up.chevron.down").font(.system(size: 8, weight: .semibold)).foregroundStyle(.tertiary)
-                }
-                .foregroundStyle(device == nil ? T.warn : .primary)
-                .padding(.horizontal, 8).padding(.vertical, 4)
-                .background(Capsule().fill(T.card))
-                .overlay(Capsule().strokeBorder(T.hairline, lineWidth: 0.5))
+                .menuStyle(.borderlessButton).menuIndicator(.visible)
             }
-            .menuStyle(.borderlessButton).menuIndicator(.hidden).fixedSize()
+            .padding(.leading, 8).padding(.trailing, 2).padding(.vertical, 3)
+            .background(Capsule().fill(T.card))
+            .overlay(Capsule().strokeBorder(T.hairline, lineWidth: 0.5))
+            .layoutPriority(1)
 
             IconButton("slider.horizontal.3", active: editing) {
                 audio.setRackScope(.route(route.id))
@@ -1130,29 +1149,31 @@ struct ChainColumn: View {
     var body: some View {
         VStack(alignment: .leading, spacing: 0) {
             if !audio.routes.isEmpty || audio.virtualMicInstalled {
-                Menu {
-                    Button { audio.setRackScope(.system) } label: {
-                        HStack { Text("System"); if audio.rackScope == .system { Image(systemName: "checkmark") } }
-                    }
-                    if audio.virtualMicInstalled {
-                        Button { audio.setRackScope(.input) } label: {
-                            HStack { Text("Microphone"); if audio.rackScope == .input { Image(systemName: "checkmark") } }
+                Hug {
+                    Menu {
+                        Button { audio.setRackScope(.system) } label: {
+                            HStack { Text("System"); if audio.rackScope == .system { Image(systemName: "checkmark") } }
                         }
-                    }
-                    if !audio.routes.isEmpty { Divider() }
-                    ForEach(audio.routes) { route in
-                        Button { audio.setRackScope(.route(route.id)) } label: {
-                            HStack { Text(route.name); if audio.rackScope == .route(route.id) { Image(systemName: "checkmark") } }
+                        if audio.virtualMicInstalled {
+                            Button { audio.setRackScope(.input) } label: {
+                                HStack { Text("Microphone"); if audio.rackScope == .input { Image(systemName: "checkmark") } }
+                            }
                         }
+                        if !audio.routes.isEmpty { Divider() }
+                        ForEach(audio.routes) { route in
+                            Button { audio.setRackScope(.route(route.id)) } label: {
+                                HStack { Text(route.name); if audio.rackScope == .route(route.id) { Image(systemName: "checkmark") } }
+                            }
+                        }
+                    } label: {
+                        HStack(spacing: 5) {
+                            Image(systemName: audio.rackScope.symbol).font(.system(size: 10))
+                            Text(scopeName).font(.system(size: 11.5, weight: .semibold)).lineLimit(1)
+                        }
+                        .foregroundStyle(T.accent)
                     }
-                } label: {
-                    HStack(spacing: 5) {
-                        Image(systemName: audio.rackScope.symbol).font(.system(size: 10))
-                        Text(scopeName).font(.system(size: 11.5, weight: .semibold)).lineLimit(1)
-                    }
-                    .foregroundStyle(T.accent)
+                    .menuStyle(.borderlessButton).menuIndicator(.visible)
                 }
-                .menuStyle(.borderlessButton).menuIndicator(.visible).fixedSize()
                 .padding(.leading, 9).padding(.trailing, 3).padding(.vertical, 4)
                 .background(Capsule().fill(T.accent.opacity(0.12)))
                 .help("Which chain to edit")
@@ -1281,29 +1302,31 @@ struct ModuleEditor: View {
                         Image(systemName: module.kind.symbol).font(.system(size: 12)).foregroundStyle(T.accent)
                         Text(module.title).font(.system(size: 13, weight: .semibold)).lineLimit(1)
                     } else {
-                        Menu {
-                            ForEach(audio.rack.modules) { other in
-                                Button { audio.selectedModule = other.id } label: {
-                                    HStack { Label(other.title, systemImage: other.kind.symbol); if other.id == module.id { Image(systemName: "checkmark") } }
+                        Hug {
+                            Menu {
+                                ForEach(audio.rack.modules) { other in
+                                    Button { audio.selectedModule = other.id } label: {
+                                        HStack { Label(other.title, systemImage: other.kind.symbol); if other.id == module.id { Image(systemName: "checkmark") } }
+                                    }
                                 }
-                            }
-                            Divider()
-                            Menu("Add") {
-                                ForEach(["Tone", "Character", "Dynamics", "Space"], id: \.self) { group in
-                                    Section(group) {
-                                        ForEach(ModuleKind.allCases.filter { $0.group == group }) { kind in
-                                            Button { audio.addModule(kind) } label: { Label(kind.title, systemImage: kind.symbol) }
+                                Divider()
+                                Menu("Add") {
+                                    ForEach(["Tone", "Character", "Dynamics", "Space"], id: \.self) { group in
+                                        Section(group) {
+                                            ForEach(ModuleKind.allCases.filter { $0.group == group }) { kind in
+                                                Button { audio.addModule(kind) } label: { Label(kind.title, systemImage: kind.symbol) }
+                                            }
                                         }
                                     }
                                 }
+                            } label: {
+                                HStack(spacing: 6) {
+                                    Image(systemName: module.kind.symbol).font(.system(size: 12)).foregroundStyle(T.accent)
+                                    Text(module.title).font(.system(size: 13, weight: .semibold)).lineLimit(1)
+                                }
                             }
-                        } label: {
-                            HStack(spacing: 6) {
-                                Image(systemName: module.kind.symbol).font(.system(size: 12)).foregroundStyle(T.accent)
-                                Text(module.title).font(.system(size: 13, weight: .semibold)).lineLimit(1)
-                            }
+                            .menuStyle(.borderlessButton).menuIndicator(.visible)
                         }
-                        .menuStyle(.borderlessButton).menuIndicator(.visible).fixedSize()
                         .padding(.leading, 6).padding(.trailing, 2).padding(.vertical, 3)
                         .background(RoundedRectangle(cornerRadius: 6).fill(T.card))
                         .help("Which module to edit")
