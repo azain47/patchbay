@@ -111,8 +111,14 @@ enum T {
         onAccent = a == .mono ? Color(nsColor: .windowBackgroundColor) : Color.black.opacity(0.82)
     }
 
-    static let quick = Animation.spring(response: 0.15, dampingFraction: 0.92)
+    static let quick = Animation.spring(response: 0.22, dampingFraction: 0.86)
     static let tab = Animation.spring(response: 0.16, dampingFraction: 0.95)
+    /// Selection movement: fast with a hint of overshoot.
+    static let snap = Animation.spring(response: 0.26, dampingFraction: 0.78)
+    /// Things appearing: rise a few points while fading in.
+    static let rise = AnyTransition.asymmetric(
+        insertion: .opacity.combined(with: .offset(y: 6)).combined(with: .scale(scale: 0.98, anchor: .top)),
+        removal: .opacity)
     static let hoverAnim = Animation.easeOut(duration: 0.07)
 }
 
@@ -134,11 +140,12 @@ extension EnvironmentValues {
 }
 
 struct Press: ButtonStyle {
+    var scale: CGFloat = 0.96
     func makeBody(configuration: Configuration) -> some View {
         configuration.label
-            .scaleEffect(configuration.isPressed ? 0.975 : 1)
-            .opacity(configuration.isPressed ? 0.75 : 1)
-            .animation(T.quick, value: configuration.isPressed)
+            .scaleEffect(configuration.isPressed ? scale : 1)
+            .opacity(configuration.isPressed ? 0.8 : 1)
+            .animation(configuration.isPressed ? .spring(response: 0.12, dampingFraction: 0.9) : T.snap, value: configuration.isPressed)
     }
 }
 
@@ -295,9 +302,11 @@ struct Root: View {
 struct TabBar: View {
     @Binding var tab: Tab
 
-    /// Deliberately static. A tab switch changes nothing but which icon is lit;
-    /// no sliding pill, no symbol morph. The page swap is instant too.
+    /// The lit pill slides between icons on its own spring. It is an offset inside this
+    /// view, animated by a modifier here, so no animation transaction reaches the pages:
+    /// their swap (and the popover's resize) stays instant.
     var body: some View {
+        let index = CGFloat(Tab.allCases.firstIndex(of: tab) ?? 0)
         HStack(spacing: 2) {
             ForEach(Tab.allCases) { t in
                 Button { tab = t } label: {
@@ -305,17 +314,19 @@ struct TabBar: View {
                         .font(.system(size: 11, weight: .medium))
                         .foregroundStyle(tab == t ? .primary : .secondary)
                         .frame(width: 30, height: 22)
-                        .background(Capsule().fill(tab == t ? T.press : .clear))
                         .contentShape(Capsule())
                 }
                 .buttonStyle(.plain)  // Press() animates on isPressed, which coincides with the tab change
                 .help(t.title)
             }
         }
+        .background(alignment: .leading) {
+            Capsule().fill(T.press).frame(width: 30, height: 22).offset(x: index * 32)
+        }
+        .animation(T.snap, value: tab)
         .padding(2)
         .background(Capsule().fill(T.card))
         .overlay(Capsule().strokeBorder(T.hairline, lineWidth: 0.5))
-        .animation(nil, value: tab)
     }
 }
 
@@ -335,7 +346,7 @@ struct Footer: View {
                     Text(notice).font(.system(size: 11)).foregroundStyle(.primary).lineLimit(1).truncationMode(.middle)
                 }
                 .help(notice)
-                .transition(.opacity)
+                .transition(.asymmetric(insertion: .opacity.combined(with: .offset(y: 8)), removal: .opacity))
             } else {
                 Text(audio.scopeOn ? audio.scopeStatus.label : (audio.headerScope == .system ? "rack off" : "route off"))
                     .font(m.mono).foregroundStyle(.tertiary).lineLimit(1).truncationMode(.middle)
@@ -805,6 +816,8 @@ struct DeviceRow<Accessory: View>: View {
         .contentShape(Rectangle())
         .onTapGesture(perform: action)
         .hoverRow(m.subtitle ? 8 : 6)
+        .animation(T.snap, value: selected)
+        .animation(T.quick, value: isRackTarget)
     }
 }
 
@@ -966,6 +979,7 @@ struct Fader: View {
     var label: ((Double) -> String)? = nil
     let set: (Double) -> Void
     @State private var dragging = false
+    @State private var hover = false
     @State private var scrub = Scrub()
 
     private func norm(_ v: Double) -> Double {
@@ -993,9 +1007,11 @@ struct Fader: View {
                     Capsule().fill(T.accent.opacity(0.8)).frame(width: max(0, x), height: 3)
                 }
                 Circle().fill(Color.white).frame(width: dragging ? 13 : 11, height: dragging ? 13 : 11)
+                    .background(Circle().fill(T.accent.opacity(dragging ? 0.28 : (hover ? 0.18 : 0))).frame(width: 22, height: 22))
                     .shadow(color: .black.opacity(0.35), radius: 1.5, y: 0.5)
                     .offset(x: max(0, min(w - 11, x - 5.5)))
-                    .animation(T.quick, value: dragging)
+                    .animation(T.snap, value: dragging)
+                    .animation(T.hoverAnim, value: hover)
                     .overlay(alignment: .leading) {
                         // Beside the knob, not above it: rows sit at the top of a clipping scroll view.
                         if dragging && scrub.shift {
@@ -1008,7 +1024,9 @@ struct Fader: View {
                     }
             }
             .frame(height: 18)
+            .animation(dragging ? nil : T.snap, value: value)
             .contentShape(Rectangle())
+            .onHover { hover = $0 }
             .gesture(DragGesture(minimumDistance: 0)
                 .onChanged { v in
                     dragging = true
@@ -1027,6 +1045,7 @@ struct VFader: View {
     var label: ((Double) -> String)? = nil
     let set: (Double) -> Void
     @State private var dragging = false
+    @State private var hover = false
     @State private var scrub = Scrub()
 
     private var bubbleText: String { label?(value) ?? String(format: "%+.1f", value) }
@@ -1042,9 +1061,11 @@ struct VFader: View {
                 Rectangle().fill(T.accent.opacity(0.85)).frame(width: 3, height: max(1, abs(y - cy))).offset(y: min(y, cy))
                 Rectangle().fill(Color.primary.opacity(0.35)).frame(width: 9, height: 1).offset(y: cy)
                 Circle().fill(Color.white).frame(width: dragging ? 13 : 11, height: dragging ? 13 : 11)
+                    .background(Circle().fill(T.accent.opacity(dragging ? 0.28 : (hover ? 0.18 : 0))).frame(width: 22, height: 22))
                     .shadow(color: .black.opacity(0.35), radius: 1.5, y: 0.5)
                     .offset(y: max(0, min(h - 11, y - 5.5)))
-                    .animation(T.quick, value: dragging)
+                    .animation(T.snap, value: dragging)
+                    .animation(T.hoverAnim, value: hover)
                     .overlay(alignment: .top) {
                         if dragging && scrub.shift {
                             ScrubBubble(text: bubbleText)
@@ -1053,7 +1074,9 @@ struct VFader: View {
                     }
             }
             .frame(maxWidth: .infinity)
+            .animation(dragging ? nil : T.snap, value: value)
             .contentShape(Rectangle())
+            .onHover { hover = $0 }
             .gesture(DragGesture(minimumDistance: 0)
                 .onChanged { v in
                     dragging = true
@@ -1115,7 +1138,7 @@ struct RackTab: View {
     var body: some View {
         let editorWidth = chainOpen ? m.width - m.chainW - 0.5 : m.width
         VStack(spacing: 0) {
-            if !audio.scopeOn { OffBanner(audio: audio) }
+            if !audio.scopeOn { OffBanner(audio: audio).transition(.move(edge: .top).combined(with: .opacity)) }
             HStack(spacing: 0) {
                 if chainOpen {
                     ChainColumn(audio: audio)
@@ -1128,9 +1151,10 @@ struct RackTab: View {
                         Graph(audio: audio)
                             .frame(height: m.faderH + 40)
                             .padding(.horizontal, m.gutter).padding(.top, m.sectionTop).padding(.bottom, 2)
-                            .transition(.opacity)
+                            .transition(.asymmetric(insertion: .opacity.combined(with: .scale(scale: 0.96, anchor: .top)), removal: .opacity))
                     }
                     ModuleEditor(audio: audio, chainOpen: chainOpen)
+                        .animation(T.snap, value: audio.selectedModule)
                 }
                 .frame(width: editorWidth)
                 .clipped()
@@ -1140,9 +1164,9 @@ struct RackTab: View {
             Rectangle().fill(T.hairline).frame(height: 0.5)
 
             HStack(spacing: 6) {
-                IconButton("sidebar.left", active: chainOpen) { withAnimation(T.quick) { chainOpen.toggle() } }
+                IconButton("sidebar.left", active: chainOpen) { withAnimation(T.snap) { chainOpen.toggle() } }
                     .help(chainOpen ? "Hide chain" : "Show chain")
-                IconButton("waveform.path.ecg", active: showGraph) { withAnimation(T.quick) { showGraph.toggle() } }
+                IconButton("waveform.path.ecg", active: showGraph) { withAnimation(T.snap) { showGraph.toggle() } }
                     .help(showGraph ? "Hide graph" : "Show response and spectrum")
                 Button { audio.setBypass(!audio.rack.bypass) } label: {
                     Text("Bypass").font(.system(size: 11, weight: .medium))
@@ -1152,7 +1176,7 @@ struct RackTab: View {
                         .overlay(Capsule().strokeBorder(T.hairline, lineWidth: 0.5))
                         .fixedSize()
                 }
-                .buttonStyle(Press())
+                .buttonStyle(Press(scale: 0.92))
                 .help("Hear the unprocessed signal (A/B)")
                 .animation(T.quick, value: audio.rack.bypass)
                 .padding(.leading, 4)
@@ -1181,6 +1205,7 @@ struct RackTab: View {
             }
             .padding(.horizontal, m.gutter - 4).padding(.vertical, 8)
         }
+        .animation(T.quick, value: audio.scopeOn)
         .presetPrompt(audio: audio)
     }
 
@@ -1341,6 +1366,7 @@ struct ChainColumn: View {
     @ObservedObject var audio: AudioState
     @State private var dragging: UUID?
     @State private var dragOffset: CGFloat = 0
+    @Namespace private var selection
 
     private var rowPitch: CGFloat { m.chainRowH + 4 }
 
@@ -1407,10 +1433,12 @@ struct ChainColumn: View {
             ScrollView(showsIndicators: false) {
                 VStack(spacing: 4) {
                     ForEach(Array(audio.rack.modules.enumerated()), id: \.element.id) { index, module in
-                        ChainRow(module: module, selected: audio.selectedModule == module.id, lifted: dragging == module.id,
-                                 select: { audio.selectedModule = module.id },
+                        ChainRow(module: module, selected: audio.selectedModule == module.id, lifted: dragging == module.id, selection: selection,
+                                 select: { withAnimation(T.snap) { audio.selectedModule = module.id } },
                                  toggle: { audio.setModuleEnabled(module.id, !module.enabled) })
                             .frame(height: m.chainRowH)
+                            .transition(.asymmetric(insertion: .opacity.combined(with: .scale(scale: 0.92)).combined(with: .offset(x: -8)),
+                                                    removal: .opacity.combined(with: .scale(scale: 0.92))))
                             .offset(y: displacement(of: index))
                             .zIndex(dragging == module.id ? 1 : 0)
                             .gesture(
@@ -1470,6 +1498,7 @@ struct ChainRow: View {
     let module: RackModule
     let selected: Bool
     let lifted: Bool
+    let selection: Namespace.ID
     let select: () -> Void
     let toggle: () -> Void
     @State private var hover = false
@@ -1495,8 +1524,16 @@ struct ChainRow: View {
         }
         .padding(.horizontal, 8)
         .frame(maxHeight: .infinity)
-        .background(RoundedRectangle(cornerRadius: 7).fill(selected ? T.press : (hover ? T.hover : T.card)))
-        .overlay(RoundedRectangle(cornerRadius: 7).strokeBorder(selected ? T.accent.opacity(0.5) : T.hairline, lineWidth: 0.5))
+        .background(RoundedRectangle(cornerRadius: 7).fill(hover ? T.hover : T.card))
+        .background {
+            // One highlight that travels between rows instead of each row fading its own.
+            if selected {
+                RoundedRectangle(cornerRadius: 7).fill(T.press)
+                    .overlay(RoundedRectangle(cornerRadius: 7).strokeBorder(T.accent.opacity(0.5), lineWidth: 0.5))
+                    .matchedGeometryEffect(id: "selected", in: selection)
+            }
+        }
+        .overlay(RoundedRectangle(cornerRadius: 7).strokeBorder(T.hairline, lineWidth: selected ? 0 : 0.5))
         .shadow(color: .black.opacity(lifted ? 0.28 : 0), radius: lifted ? 10 : 0, y: lifted ? 4 : 0)
         .scaleEffect(lifted ? 1.03 : 1)
         .contentShape(Rectangle())
@@ -1504,8 +1541,8 @@ struct ChainRow: View {
         .onHover { hover = $0 }
         .help(module.title)
         .animation(T.hoverAnim, value: hover)
-        .animation(T.quick, value: selected)
-        .animation(T.quick, value: lifted)
+        .animation(T.snap, value: selected)
+        .animation(T.snap, value: lifted)
     }
 }
 
@@ -1609,6 +1646,7 @@ struct ModuleEditor: View {
                 }
             }
             .id(module.id)
+            .transition(.asymmetric(insertion: .opacity.combined(with: .offset(x: 10)), removal: .identity))
         } else {
             VStack(spacing: 8) {
                 Image(systemName: "slider.horizontal.3").font(.system(size: 22)).foregroundStyle(.quaternary)
@@ -1630,8 +1668,11 @@ struct IconButton: View {
             Image(systemName: symbol).font(.system(size: 10, weight: .medium))
                 .foregroundStyle(active ? T.accent : (hover ? .primary : .secondary)).frame(width: 24, height: 22)
                 .background(RoundedRectangle(cornerRadius: 6).fill(active ? T.press : (hover ? T.hover : .clear)))
+                .scaleEffect(hover ? 1.06 : 1)
         }
-        .buttonStyle(Press()).onHover { hover = $0 }.animation(T.hoverAnim, value: hover)
+        .buttonStyle(Press(scale: 0.88)).onHover { hover = $0 }
+        .animation(T.hoverAnim, value: hover)
+        .animation(T.snap, value: active)
     }
 }
 
@@ -1685,19 +1726,22 @@ struct Graph: View {
             }
             ctx.draw(Text(String(format: "±%.0f dB", range)).font(m.monoSmall).foregroundStyle(.quaternary), at: CGPoint(x: w - 3, y: 7), anchor: .trailing)
 
-            func curve(_ values: [Double]) -> Path {
-                var p = Path()
-                for (i, db) in values.enumerated() {
-                    let pt = CGPoint(x: CGFloat(i) / CGFloat(values.count - 1) * w, y: y(db))
-                    i == 0 ? p.move(to: pt) : p.addLine(to: pt)
+        }
+        // The curves are shapes on top of the canvas so they morph: a fader drag, a preset
+        // or a new profile springs the response into place instead of jumping.
+        .overlay {
+            let norm = CurveVector(chain.map { $0 / range })
+            ZStack {
+                if let selected {
+                    ResponseCurve(values: CurveVector(selected.map { $0 / range }))
+                        .stroke(Color.primary.opacity(0.35), style: StrokeStyle(lineWidth: 1, dash: [3, 3]))
+                        .transition(.opacity)
                 }
-                return p
+                ResponseCurve(values: norm, closed: true).fill(T.accent.opacity(0.12))
+                ResponseCurve(values: norm).stroke(T.accent, style: StrokeStyle(lineWidth: 1.5, lineJoin: .round))
             }
-            if let selected { ctx.stroke(curve(selected), with: .color(Color.primary.opacity(0.35)), style: StrokeStyle(lineWidth: 1, dash: [3, 3])) }
-            var fill = curve(chain)
-            fill.addLine(to: CGPoint(x: w, y: h / 2)); fill.addLine(to: CGPoint(x: 0, y: h / 2)); fill.closeSubpath()
-            ctx.fill(fill, with: .color(T.accent.opacity(0.12)))
-            ctx.stroke(curve(chain), with: .color(T.accent), lineWidth: 1.5)
+            .animation(T.snap, value: norm)
+            .animation(T.quick, value: selected == nil)
         }
         .background(RoundedRectangle(cornerRadius: 8).fill(T.card))
         .overlay(RoundedRectangle(cornerRadius: 8).strokeBorder(T.hairline, lineWidth: 0.5))
@@ -1706,6 +1750,42 @@ struct Graph: View {
     }
 
     private static func frequency(at t: Double) -> Double { fMin * pow(fMax / fMin, t) }
+}
+
+/// Response values scaled to ±1 of the graph's range; animatable element by element.
+struct CurveVector: VectorArithmetic {
+    var v: [Double]
+    init(_ v: [Double]) { self.v = v }
+    static var zero: CurveVector { CurveVector([]) }
+    private static func combine(_ a: CurveVector, _ b: CurveVector, _ f: (Double, Double) -> Double) -> CurveVector {
+        let n = max(a.v.count, b.v.count)
+        return CurveVector((0..<n).map { f($0 < a.v.count ? a.v[$0] : 0, $0 < b.v.count ? b.v[$0] : 0) })
+    }
+    static func + (a: CurveVector, b: CurveVector) -> CurveVector { combine(a, b, +) }
+    static func - (a: CurveVector, b: CurveVector) -> CurveVector { combine(a, b, -) }
+    mutating func scale(by rhs: Double) { v = v.map { $0 * rhs } }
+    var magnitudeSquared: Double { v.reduce(0) { $0 + $1 * $1 } }
+}
+
+struct ResponseCurve: Shape {
+    var values: CurveVector
+    var closed = false
+    var animatableData: CurveVector {
+        get { values }
+        set { values = newValue }
+    }
+    func path(in rect: CGRect) -> Path {
+        var p = Path()
+        let v = values.v
+        guard v.count > 1 else { return p }
+        let mid = rect.midY, span = rect.height / 2 - 8
+        for (i, n) in v.enumerated() {
+            let pt = CGPoint(x: rect.minX + CGFloat(i) / CGFloat(v.count - 1) * rect.width, y: mid - CGFloat(n) * span)
+            i == 0 ? p.move(to: pt) : p.addLine(to: pt)
+        }
+        if closed { p.addLine(to: CGPoint(x: rect.maxX, y: mid)); p.addLine(to: CGPoint(x: rect.minX, y: mid)); p.closeSubpath() }
+        return p
+    }
 }
 
 struct ParametricEditor: View {
@@ -1735,10 +1815,13 @@ struct ParametricEditor: View {
             }
             ProfileChips(audio: audio)
             if !query.isEmpty {
-                switch audio.profileSource {
-                case .autoEQ: AutoEQResults(audio: audio, query: query) { query = "" }
-                case .squig: SquigResults(audio: audio, query: query) { query = "" }
+                Group {
+                    switch audio.profileSource {
+                    case .autoEQ: AutoEQResults(audio: audio, query: query) { query = "" }
+                    case .squig: SquigResults(audio: audio, query: query) { query = "" }
+                    }
                 }
+                .transition(T.rise)
             }
 
             BandColumns(bands: bands, selected: current?.id, height: m.faderH,
@@ -1762,7 +1845,8 @@ struct ParametricEditor: View {
             }
         }
         .animation(T.quick, value: module.bands.map(\.id))
-        .animation(T.quick, value: selectedBand)
+        .animation(T.snap, value: selectedBand)
+        .animation(T.quick, value: query.isEmpty)
     }
 
     private func loadCatalog() {
@@ -1783,6 +1867,7 @@ struct BandColumns: View {
     let height: CGFloat
     let select: (UUID) -> Void
     let setGain: (UUID, Double) -> Void
+    @Namespace private var highlight
 
     var body: some View {
         // Columns share the editor width down to 28 pt each (enough for "10.3k"); past that
@@ -1799,8 +1884,15 @@ struct BandColumns: View {
                     BandColumn(band: band, selected: band.id == selected, height: height,
                                select: { select(band.id) }, setGain: { setGain(band.id, $0) })
                         .frame(width: width)
+                        .background {
+                            if band.id == selected {
+                                RoundedRectangle(cornerRadius: 6).fill(T.press).matchedGeometryEffect(id: "selected", in: highlight)
+                            }
+                        }
+                        .transition(.opacity.combined(with: .scale(scale: 0.6, anchor: .bottom)))
                 }
             }
+            .animation(T.snap, value: selected)
             .padding(.vertical, 8).padding(.horizontal, inset)
             .frame(minWidth: available + 2 * inset, alignment: .center)
         }
@@ -1845,10 +1937,10 @@ struct BandColumn: View {
             Circle().fill(band.enabled ? T.accent : Color.primary.opacity(0.18)).frame(width: 5, height: 5)
         }
         .padding(.vertical, 4)
-        .background(RoundedRectangle(cornerRadius: 6).fill(selected ? T.press : .clear))
         .contentShape(Rectangle())
         .onTapGesture(perform: select)
         .opacity(band.enabled ? 1 : 0.55)
+        .animation(T.quick, value: band.enabled)
     }
 }
 
