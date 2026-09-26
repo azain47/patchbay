@@ -320,8 +320,10 @@ struct RackSettings: Codable, Equatable {
 
     static let neutral = RackSettings()
 
+    /// Changes when the realtime section layout changes (and filter memory must reset):
+    /// module order, kinds, band counts, and a filter's number of sections.
     var layoutKey: String {
-        modules.map { "\($0.id):\($0.kind.rawValue):\($0.bands.count)" }.joined(separator: "|")
+        modules.map { "\($0.id):\($0.kind.rawValue):\($0.bands.count):\($0.kind == .filter ? Int($0.param("slope")) : 0)" }.joined(separator: "|")
     }
 }
 
@@ -350,13 +352,26 @@ final class RackSettingsStore {
 
 // MARK: - Presets
 
-/// A named snapshot of a chain. `device` is the output it was saved for: an output that
-/// shows up with no chain of its own starts from the preset remembered for its name.
+/// A named snapshot of a chain. `devices` are the outputs (by UID) it is bound to: switching
+/// to one of them loads the preset unless that output's chain already came from it.
 struct Preset: Codable, Identifiable, Equatable {
     var id = UUID()
     var name: String
-    var device: String?
+    var devices: [String] = []
     var modules: [RackModule]
+
+    init(name: String, devices: [String] = [], modules: [RackModule]) {
+        self.name = name; self.devices = devices; self.modules = modules
+    }
+
+    private enum CodingKeys: String, CodingKey { case id, name, devices, modules }
+    init(from decoder: Decoder) throws {
+        let c = try decoder.container(keyedBy: CodingKeys.self)
+        id = try c.decode(UUID.self, forKey: .id)
+        name = try c.decode(String.self, forKey: .name)
+        devices = try c.decodeIfPresent([String].self, forKey: .devices) ?? []
+        modules = try c.decode([RackModule].self, forKey: .modules)
+    }
 }
 
 final class PresetStore {
@@ -512,10 +527,10 @@ enum BiquadDesign {
 // MARK: - Frequency response of the linear stages
 
 extension RackModule {
-    /// Biquad cascade this module contributes, for the response curve. Nil for
-    /// modules whose transfer depends on the signal (dynamics, saturation, space).
-    var linearCascade: [PBBiquad]? {
-        let sr = 48_000.0
+    /// Biquad cascade this module contributes, for the response curve, designed at the
+    /// rate the chain runs at (RBJ sections cramp towards Nyquist, so it matters up top).
+    /// Nil for modules whose transfer depends on the signal (dynamics, saturation, space).
+    func linearCascade(sampleRate sr: Double) -> [PBBiquad]? {
         switch kind {
         case .parametricEQ, .graphicEQ:
             return bands.filter(\.enabled).map { BiquadDesign.coefficients(type: $0.type, frequency: $0.frequency, gainDB: $0.gainDB, q: $0.q, sampleRate: sr) }
@@ -544,16 +559,16 @@ extension RackModule {
         }
     }
 
-    func responseDB(at frequency: Double) -> Double {
-        guard let cascade = linearCascade else { return 0 }
-        return linearGainDB + BiquadDesign.responseDB(cascade, frequency: frequency, sampleRate: 48_000)
+    func responseDB(at frequency: Double, sampleRate: Double) -> Double {
+        guard let cascade = linearCascade(sampleRate: sampleRate) else { return 0 }
+        return linearGainDB + BiquadDesign.responseDB(cascade, frequency: frequency, sampleRate: sampleRate)
     }
 }
 
 extension RackSettings {
     /// Combined response of every enabled linear module. Nonlinear modules are skipped.
-    func responseDB(at frequency: Double) -> Double {
-        bypass ? 0 : modules.filter(\.enabled).reduce(0) { $0 + $1.responseDB(at: frequency) }
+    func responseDB(at frequency: Double, sampleRate: Double) -> Double {
+        bypass ? 0 : modules.filter(\.enabled).reduce(0) { $0 + $1.responseDB(at: frequency, sampleRate: sampleRate) }
     }
 }
 
@@ -587,8 +602,12 @@ extension RackSettings {
                 p = [dbToLin(v("gain"))]
             case .parametricEQ, .graphicEQ:
                 p = [dbToLin(v("preamp"))]
-                for band in module.bands where band.enabled {
-                    biquads.append(BiquadDesign.coefficients(type: band.type, frequency: band.frequency, gainDB: band.gainDB, q: band.q, sampleRate: sampleRate))
+                // A disabled band stays in the cascade as a pass-through section: dropping it
+                // would shift every later section onto its neighbour's filter memory (a click).
+                for band in module.bands {
+                    biquads.append(band.enabled
+                        ? BiquadDesign.coefficients(type: band.type, frequency: band.frequency, gainDB: band.gainDB, q: band.q, sampleRate: sampleRate)
+                        : PBBiquad(b0: 1, b1: 0, b2: 0, a1: 0, a2: 0))
                 }
             case .filter:
                 let type: FilterType = [FilterType.lowPass, .highPass, .bandPass][min(2, max(0, Int(v("type"))))]
@@ -687,6 +706,12 @@ final class RealtimeDSP {
     private let proofOnly: Bool
     private let sampleRate: Double
     private let biquadMemory: UnsafeMutablePointer<BiquadMemory>
+    /// Coefficients actually running. Each sample they glide towards the published ones
+    /// (10 ms time constant), so a fader drag or a band switched off never steps the filter under its
+    /// own state. A blend of two stable sections is stable: the (a1, a2) region is convex.
+    private let live: UnsafeMutablePointer<PBBiquad>
+    private var liveValid = false
+    private let glide: Double
     private let moduleMemory: UnsafeMutablePointer<ModuleMemory>
     private let lineCapacity: Int
     private let lines: UnsafeMutablePointer<Float>          // PB_MAX_MODULES * lineCapacity
@@ -723,6 +748,9 @@ final class RealtimeDSP {
         let modules = Int(PB_MAX_MODULES)
         biquadMemory = .allocate(capacity: Int(PB_MAX_BIQUADS))
         biquadMemory.initialize(repeating: BiquadMemory(), count: Int(PB_MAX_BIQUADS))
+        live = .allocate(capacity: Int(PB_MAX_BIQUADS))
+        live.initialize(repeating: PBBiquad(b0: 1, b1: 0, b2: 0, a1: 0, a2: 0), count: Int(PB_MAX_BIQUADS))
+        glide = 1 - exp(-1 / (sampleRate * 0.010))
         moduleMemory = .allocate(capacity: modules)
         moduleMemory.initialize(repeating: ModuleMemory(), count: modules)
         lineCapacity = Int(sampleRate * 2.2)
@@ -755,6 +783,7 @@ final class RealtimeDSP {
 
     deinit {
         biquadMemory.deallocate()
+        live.deallocate()
         moduleMemory.deallocate()
         lines.deallocate()
         reverbState.deallocate()
@@ -830,9 +859,13 @@ final class RealtimeDSP {
         if proofOnly { clear(outputs); return }
         guard let config = PBDSPConfigStoreLoad(store) else { clear(outputs); return }
 
-        if config.pointee.layoutGeneration != lastLayout {
+        if config.pointee.layoutGeneration != lastLayout || !liveValid {
+            // New section layout: state is cleared, so start from the targets outright.
             resetMemory()
             lastLayout = config.pointee.layoutGeneration
+            let targets = (UnsafeRawPointer(config) + Self.biquadsOffset).assumingMemoryBound(to: PBBiquad.self)
+            live.update(from: targets, count: Int(config.pointee.biquadCount))
+            liveValid = true
         }
 
         if config.pointee.bypass != 0 || config.pointee.moduleCount == 0 {
@@ -907,7 +940,14 @@ final class RealtimeDSP {
     }
 
     @inline(__always)
-    private func biquadRun(_ c: PBBiquad, _ mem: UnsafeMutablePointer<BiquadMemory>, _ l: inout Double, _ r: inout Double) {
+    private func biquadRun(_ t: UnsafePointer<PBBiquad>, _ lc: UnsafeMutablePointer<PBBiquad>, _ mem: UnsafeMutablePointer<BiquadMemory>, _ l: inout Double, _ r: inout Double) {
+        let k = glide
+        lc.pointee.b0 += k * (t.pointee.b0 - lc.pointee.b0)
+        lc.pointee.b1 += k * (t.pointee.b1 - lc.pointee.b1)
+        lc.pointee.b2 += k * (t.pointee.b2 - lc.pointee.b2)
+        lc.pointee.a1 += k * (t.pointee.a1 - lc.pointee.a1)
+        lc.pointee.a2 += k * (t.pointee.a2 - lc.pointee.a2)
+        let c = lc.pointee
         let yl = c.b0 * l + mem.pointee.z1L
         mem.pointee.z1L = c.b1 * l - c.a1 * yl + mem.pointee.z2L
         mem.pointee.z2L = c.b2 * l - c.a2 * yl
@@ -932,6 +972,7 @@ final class RealtimeDSP {
         let mem = moduleMemory + slot
         let line = lines + slot * lineCapacity
         let bq = biquadMemory + biquadStart
+        let lv = live + biquadStart
 
         switch kind {
         case 1: // gain
@@ -942,14 +983,14 @@ final class RealtimeDSP {
             let g = Double(p[0])
             for i in 0..<n {
                 var l = scratchL[i] * g, r = scratchR[i] * g
-                for b in 0..<biquadCount { biquadRun(biquads[b], bq + b, &l, &r) }
+                for b in 0..<biquadCount { biquadRun(biquads + b, lv + b, bq + b, &l, &r) }
                 scratchL[i] = l; scratchR[i] = r
             }
 
         case 4, 5: // filter cascade, loudness shelves
             for i in 0..<n {
                 var l = scratchL[i], r = scratchR[i]
-                for b in 0..<biquadCount { biquadRun(biquads[b], bq + b, &l, &r) }
+                for b in 0..<biquadCount { biquadRun(biquads + b, lv + b, bq + b, &l, &r) }
                 scratchL[i] = l; scratchR[i] = r
             }
 
@@ -957,7 +998,7 @@ final class RealtimeDSP {
             let drive = Double(p[0]), blend = Double(p[1])
             for i in 0..<n {
                 var l = scratchL[i], r = scratchR[i]
-                for b in 0..<biquadCount { biquadRun(biquads[b], bq + b, &l, &r) }
+                for b in 0..<biquadCount { biquadRun(biquads + b, lv + b, bq + b, &l, &r) }
                 let hl = tanh(l * drive) - tanh(l), hr = tanh(r * drive) - tanh(r)
                 scratchL[i] += hl * blend; scratchR[i] += hr * blend
             }
@@ -1018,7 +1059,7 @@ final class RealtimeDSP {
             var env = mem.pointee.d.0
             for i in 0..<n {
                 var sl = scratchL[i], sr = scratchR[i]
-                for b in 0..<biquadCount { biquadRun(biquads[b], bq + b, &sl, &sr) }
+                for b in 0..<biquadCount { biquadRun(biquads + b, lv + b, bq + b, &sl, &sr) }
                 let level = max(abs(sl), abs(sr))
                 env = level > env ? att * env + (1 - att) * level : rel * env + (1 - rel) * level
                 let g = pow(10, computeGainReduction(over: dB(env) - thr, ratio: ratio, knee: 3) / 20)
@@ -1080,7 +1121,7 @@ final class RealtimeDSP {
                 let l = scratchL[i], r = scratchR[i]
                 let rd = (w - delay + half) % half
                 var xl = Double(line[half + rd]), xr = Double(line[rd])   // cross: L gets delayed R
-                for b in 0..<biquadCount { biquadRun(biquads[b], bq + b, &xl, &xr) }
+                for b in 0..<biquadCount { biquadRun(biquads + b, lv + b, bq + b, &xl, &xr) }
                 line[w] = Float(l); line[half + w] = Float(r)
                 w = (w + 1) % half
                 scratchL[i] = (l + xl * level) / (1 + level)

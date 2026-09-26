@@ -522,13 +522,14 @@ final class AudioState: ObservableObject {
         }
         if rackDeviceUID != target.uid {
             rackDeviceUID = target.uid
-            // An output seen for the first time starts from the preset remembered for its name.
-            if !rackStore.has(target.uid), let preset = presets.first(where: { $0.device == target.name }) {
-                var seeded = RackSettings.neutral
+            // An output with a bound preset loads it, unless its chain already came from it
+            // (then any edits made on top are kept).
+            if let preset = boundPreset(for: target.uid), rackStore.settings(for: target.uid).preset != preset.id || !rackStore.has(target.uid) {
+                var seeded = rackStore.settings(for: target.uid)
                 seeded.modules = preset.modules
                 seeded.preset = preset.id
                 rackStore.save(seeded, for: target.uid)
-                notice = "\(target.name): preset “\(preset.name)”"
+                notice = "\(target.name) · preset “\(preset.name)”"
             }
             if rackScope == .system {
                 var loaded = rackStore.settings(for: target.uid)
@@ -910,16 +911,16 @@ final class AudioState: ObservableObject {
         selectedModule = rack.modules.first?.id
     }
 
-    /// Snapshots the chain being edited. Saved from the system chain it is remembered for
-    /// the current output, so the same headphones pick it up on another Mac profile or
-    /// after a reset.
+    /// Snapshots the chain being edited. Saved from the system chain it is bound to the
+    /// current output, so switching back to that output later loads it.
     func savePreset(named name: String) {
         let trimmed = name.trimmingCharacters(in: .whitespaces)
         guard !trimmed.isEmpty else { return }
-        let preset = Preset(name: trimmed, device: rackScope == .system ? rackTarget?.name : nil, modules: rack.modules)
+        let preset = Preset(name: trimmed, modules: rack.modules)
         presets.append(preset)
         presetStore.save(presets)
         update { $0.preset = preset.id }
+        if rackScope == .system, let target = rackTarget { bindPreset(preset.id, to: target) }
     }
 
     func updatePreset() {
@@ -941,11 +942,24 @@ final class AudioState: ObservableObject {
         if rack.preset == id { update { $0.preset = nil } }
     }
 
-    /// Remember (or forget) the preset for the output the rack currently targets.
-    func rememberPreset(_ id: UUID, forDevice remember: Bool) {
-        guard let i = presets.firstIndex(where: { $0.id == id }) else { return }
-        presets[i].device = remember ? rackTarget?.name : nil
+    func boundPreset(for uid: String) -> Preset? { presets.first { $0.devices.contains(uid) } }
+
+    /// Binds a preset to an output (nil unbinds). An output has at most one preset. Binding
+    /// the output the system chain is on loads the preset right away.
+    func bindPreset(_ id: UUID?, to device: Device) {
+        for i in presets.indices { presets[i].devices.removeAll { $0 == device.uid } }
+        if let id, let i = presets.firstIndex(where: { $0.id == id }) { presets[i].devices.append(device.uid) }
         presetStore.save(presets)
+        guard let id, let preset = presets.first(where: { $0.id == id }) else { return }
+        if rackScope == .system, rackTarget?.uid == device.uid {
+            if rack.preset != id { applyPreset(preset) }
+        } else if rackStore.settings(for: device.uid).preset != id {
+            var stored = rackStore.settings(for: device.uid)
+            stored.modules = preset.modules
+            stored.preset = id
+            rackStore.save(stored, for: device.uid)
+            if rackTarget?.uid == device.uid, rackOn { engine.publish(systemRack) }
+        }
     }
 
     // MARK: Correction profiles, import, export
@@ -1137,7 +1151,6 @@ final class Bar: NSObject, NSPopoverDelegate {
     private var monitor: Any?
     private var resignObserver: NSObjectProtocol?
     private var keepOpenSink: AnyCancellable?
-    private var appearanceSink: AnyCancellable?
     override init() {
         super.init()
         item = NSStatusBar.system.statusItem(withLength: NSStatusItem.variableLength)
@@ -1145,9 +1158,8 @@ final class Bar: NSObject, NSPopoverDelegate {
         let host = NSHostingController(rootView: Root(audio: audio, theme: Theme.shared))
         host.sizingOptions = .preferredContentSize
         pop.contentViewController = host
-        appearanceSink = Theme.shared.$appearance.sink { [weak self] a in
-            self?.pop.appearance = a == .system ? nil : NSAppearance(named: a == .dark ? .darkAqua : .aqua)
-        }
+        // Dark only: the palette (accents, hairlines, meters) is tuned for it.
+        pop.appearance = NSAppearance(named: .darkAqua)
         keepOpenSink = Theme.shared.$keepOpen.sink { [weak self] keep in
             guard let self else { return }
             pop.behavior = keep ? .applicationDefined : .transient
@@ -1156,12 +1168,12 @@ final class Bar: NSObject, NSPopoverDelegate {
         pop.animates = false
         pop.delegate = self
         if let b = item.button {
-            b.image = NSImage(systemSymbolName: "waveform", accessibilityDescription: "patchbay")
+            b.image = Logo.statusImage(alert: false)
             b.target = self
             b.action = #selector(tap)
         }
         audio.onHealth = { [weak self] ok in
-            self?.item.button?.image = NSImage(systemSymbolName: ok ? "waveform" : "waveform.badge.exclamationmark", accessibilityDescription: "patchbay")
+            self?.item.button?.image = Logo.statusImage(alert: !ok)
         }
     }
 

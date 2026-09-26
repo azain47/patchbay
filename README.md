@@ -34,9 +34,13 @@ A native, open-source DSP rack and per-app router for macOS system audio. No vir
 - **Equalizer APO import/export**: `ParametricEQ.txt` in, `ParametricEQ.txt` out
 - **Per-device chains**: every output device remembers its own rack
 - **Presets**: save the chain under a name and recall it on any device, route
-  or the microphone. A preset saved from an output is remembered for it, so
-  the same headphones on a fresh profile (or a new pair with the same name)
-  start from that chain automatically.
+  or the microphone. Bind a preset to an output (the bookmark on its row in the
+  output list, or *Load on …* in the preset menu) and switching to that output
+  loads it. A preset saved from the system chain is bound to the current output.
+- **EQ accuracy**: the response graph is computed from the same coefficients at
+  the device's own sample rate, so what you see is what is rendered. Coefficient
+  changes glide over 10 ms: dragging a fader, switching a band off or changing its
+  type does not click.
 - **Bypass** for instant A/B, input/output metering, **device sample rate** picker in the rack footer
 - **Output and input device switching**, hardware volume, mic gain and hardware mic mute
 - **eqMac recovery** tools (fix stuck audio, restart, reset Core Audio) on the Fix page
@@ -52,25 +56,27 @@ opens and closes without animation; in-app motion is short springs.
 
 - **Layout** follows the page by default (*Auto*): one width, device pages
   compact and only as tall as their content, the rack spacious and capped at
-  640 pt with the module editor scrolling inside. Pages crossfade; nothing is
-  rebuilt on a tab switch. *Compact*, *Comfortable* and *Spacious* pin one
-  density everywhere.
-- **Settings** live behind the gear in the footer: appearance (system, dark,
-  light — applied to the popover itself), layout, *Stay open* (otherwise a
-  click anywhere else closes the window), the shift step, accent colour, audio
-  capture topology, and the virtual microphone driver.
+  680 pt with the module editor scrolling inside. *Compact*, *Comfortable* and
+  *Spacious* pin one density everywhere. The popover is always dark.
+- **Settings** live behind the gear in the footer: layout, *Stay open*
+  (otherwise a click anywhere else closes the window), the shift step, accent
+  colour, audio capture topology, and the virtual microphone driver.
+- **Notices** (preset loaded, import failed, …) replace the footer status for a
+  few seconds rather than floating over the page. When the rack is off, a banner
+  on the rack page says so, with a button to turn it on.
 - The chain is a vertical column beside the module editor in signal order, first
   stage on top. Click a row to edit it, press and drag to reorder (the row
   follows the pointer, the others slide out of its way), dot to bypass one
   module. The sidebar button in the rack footer hides the column; the editor's
-  title then becomes the module picker, with *Add* inside it. The icon beside
-  the name in the header is the chain being edited: waveform for the system
-  chain, branch for a route, mic for the microphone.
-- The **preset chip** under the chain header shows which preset the chain came
-  from, with a dot once you have edited past it. Its menu applies a preset,
-  saves the chain as a new one, updates, renames or deletes the current one,
-  and toggles *Auto-select for <device>*. With the column hidden the same
-  items live in the module picker's *Preset* submenu.
+  title then becomes the module picker, with *Add* inside it. A badge beside the
+  wordmark says when the rack is editing a route or the microphone rather than
+  the system chain. Profile modules show the headphone name, with the source
+  underneath; long names truncate and show in full on hover.
+- The **preset bar** under the chain header shows which preset the chain came
+  from, with a dot once you have edited past it, and whether the current output
+  auto-loads it. Its menu applies a preset, saves the chain as a new one,
+  updates, renames or deletes the current one, and picks the preset to load on
+  this output. With the column hidden the same items live in the module picker.
 - **Sliders**: hold shift while dragging for fine control. The drag turns
   relative and slows to the *Shift step* set in Settings (½ to 1⁄50 of pointer
   travel), and a bubble on the knob shows the value being dialled. Applies to

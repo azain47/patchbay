@@ -21,11 +21,6 @@ final class Theme: ObservableObject {
             }
         }
     }
-    enum Appearance: String, CaseIterable, Identifiable {
-        case system, dark, light
-        var id: String { rawValue }
-        var title: String { rawValue.capitalized }
-    }
 
     /// `auto` picks per page: list pages are compact, the rack is spacious, at one width
     /// so switching tabs never jumps horizontally.
@@ -37,21 +32,21 @@ final class Theme: ObservableObject {
         func metrics(for tab: Tab) -> Metrics {
             guard self == .auto else { return metrics }
             var m = (tab == .rack ? Density.spacious : .compact).metrics
-            m.width = 480
+            m.width = 540
             return m
         }
 
         var metrics: Metrics {
             switch self {
             case .auto, .compact:
-                Metrics(width: 400, maxHeight: 480, gutter: 12, rowV: 3, rowGap: 0, badge: 22, nameSize: 12, monoSize: 10,
-                        sectionTop: 8, paramH: 20, gap: 6, bandV: 4, faderH: 84, chainW: 140, chainRowH: 26, subtitle: false)
+                Metrics(width: 420, maxHeight: 520, gutter: 12, rowV: 3, rowGap: 0, badge: 22, nameSize: 12, monoSize: 10,
+                        sectionTop: 8, paramH: 20, gap: 6, bandV: 4, faderH: 84, chainW: 150, chainRowH: 30, subtitle: false)
             case .comfortable:
-                Metrics(width: 460, maxHeight: 560, gutter: 16, rowV: 6, rowGap: 2, badge: 26, nameSize: 13, monoSize: 10.5,
-                        sectionTop: 12, paramH: 24, gap: 10, bandV: 7, faderH: 100, chainW: 156, chainRowH: 28, subtitle: true)
+                Metrics(width: 480, maxHeight: 600, gutter: 14, rowV: 6, rowGap: 2, badge: 26, nameSize: 13, monoSize: 10.5,
+                        sectionTop: 12, paramH: 24, gap: 10, bandV: 7, faderH: 100, chainW: 170, chainRowH: 34, subtitle: true)
             case .spacious:
-                Metrics(width: 540, maxHeight: 640, gutter: 20, rowV: 9, rowGap: 4, badge: 30, nameSize: 13.5, monoSize: 11,
-                        sectionTop: 16, paramH: 28, gap: 14, bandV: 10, faderH: 120, chainW: 170, chainRowH: 30, subtitle: true)
+                Metrics(width: 560, maxHeight: 680, gutter: 16, rowV: 9, rowGap: 4, badge: 30, nameSize: 13.5, monoSize: 11,
+                        sectionTop: 14, paramH: 28, gap: 12, bandV: 10, faderH: 120, chainW: 188, chainRowH: 38, subtitle: true)
             }
         }
     }
@@ -71,8 +66,7 @@ final class Theme: ObservableObject {
     }
 
     @Published var density: Density { didSet { UserDefaults.standard.set(density.rawValue, forKey: "density") } }
-    @Published var accent: Accent { didSet { UserDefaults.standard.set(accent.rawValue, forKey: "accent"); T.accent = accent.color } }
-    @Published var appearance: Appearance { didSet { UserDefaults.standard.set(appearance.rawValue, forKey: "appearance") } }
+    @Published var accent: Accent { didSet { UserDefaults.standard.set(accent.rawValue, forKey: "accent"); T.apply(accent) } }
     /// Off: the popover closes when you click anywhere else. On: it stays until the menu bar
     /// icon is clicked again, for tweaking while another app has focus.
     @Published var keepOpen: Bool { didSet { UserDefaults.standard.set(keepOpen, forKey: "keepOpen") } }
@@ -82,20 +76,23 @@ final class Theme: ObservableObject {
 
     private init() {
         accent = Accent(rawValue: UserDefaults.standard.string(forKey: "accent") ?? "") ?? .amber
-        appearance = Appearance(rawValue: UserDefaults.standard.string(forKey: "appearance") ?? "") ?? .system
         density = Density(rawValue: UserDefaults.standard.string(forKey: "density") ?? "") ?? .auto
         keepOpen = UserDefaults.standard.bool(forKey: "keepOpen")
         let fine = UserDefaults.standard.double(forKey: "scrubFine")
         scrubFine = fine > 0 ? fine : 0.1
-        T.accent = accent.color
+        T.apply(accent)
     }
 
 }
 
 // MARK: - Tokens
 
+
 enum T {
     static var accent = Color(red: 0.86, green: 0.66, blue: 0.36)
+    /// Foreground on an accent fill. Mono is the label colour itself, so it takes the
+    /// window background; every other accent is light enough for near-black.
+    static var onAccent = Color.black.opacity(0.82)
     static let ok = Color(red: 0.48, green: 0.68, blue: 0.48)
     static let warn = Color(red: 0.85, green: 0.42, blue: 0.36)
     static let hover = Color.primary.opacity(0.07)
@@ -105,6 +102,14 @@ enum T {
     static let hairline = Color.primary.opacity(0.09)
 
     static let chromePadding: CGFloat = 16
+    /// Horizontal inset of list rows; their content starts `rowInset + 10` from the edge,
+    /// which is where section labels start too.
+    static let rowInset: CGFloat = 8
+
+    static func apply(_ a: Theme.Accent) {
+        accent = a.color
+        onAccent = a == .mono ? Color(nsColor: .windowBackgroundColor) : Color.black.opacity(0.82)
+    }
 
     static let quick = Animation.spring(response: 0.15, dampingFraction: 0.92)
     static let tab = Animation.spring(response: 0.16, dampingFraction: 0.95)
@@ -153,10 +158,11 @@ extension View { func hoverRow(_ radius: CGFloat = 8) -> some View { modifier(Ho
 /// Menu fills whatever it is proposed and, pinned with fixedSize, pushes the row wider
 /// than the window when its label is long; under Hug it hugs the label and truncates.
 struct Hug: Layout {
+    var maxWidth: CGFloat = .infinity
     func sizeThatFits(proposal: ProposedViewSize, subviews: Subviews, cache: inout ()) -> CGSize {
         guard let child = subviews.first else { return .zero }
         let ideal = child.sizeThatFits(.unspecified)
-        return CGSize(width: min(ideal.width, proposal.width ?? ideal.width), height: ideal.height)
+        return CGSize(width: min(ideal.width, proposal.width ?? ideal.width, maxWidth), height: ideal.height)
     }
     func placeSubviews(in bounds: CGRect, proposal: ProposedViewSize, subviews: Subviews, cache: inout ()) {
         subviews.first?.place(at: bounds.origin, anchor: .topLeading, proposal: ProposedViewSize(bounds.size))
@@ -172,18 +178,22 @@ struct SectionLabel: View {
     }
 }
 
-/// The icon beside the name is the chain being edited (system, a route, the microphone),
-/// so the header says what the rack page will show before you get there.
+/// The mark and name; off the system chain a small badge says which chain the rack page
+/// is editing (a route, the microphone) before you get there.
 struct Wordmark: View {
     let scope: AudioState.RackScope
     var body: some View {
         HStack(spacing: 7) {
-            Image(systemName: scope.symbol).font(.system(size: 12, weight: .bold)).foregroundStyle(T.accent)
-                .frame(width: 16)
-                .contentTransition(.symbolEffect(.replace))
-                .animation(T.quick, value: scope)
-            Text("patchbay.").font(.system(size: 14, weight: .semibold, design: .rounded)).tracking(-0.2)
+            Logo.Mark().frame(width: 16, height: 16).foregroundStyle(T.accent)
+            Text("patchbay").font(.system(size: 14, weight: .semibold, design: .rounded)).tracking(-0.2)
+            if scope != .system {
+                Image(systemName: scope.symbol).font(.system(size: 9, weight: .bold)).foregroundStyle(T.accent)
+                    .frame(width: 18, height: 16)
+                    .background(Capsule().fill(T.accent.opacity(0.14)))
+                    .transition(.opacity)
+            }
         }
+        .animation(T.quick, value: scope)
     }
 }
 
@@ -226,6 +236,10 @@ struct Root: View {
                 }
             }
             .padding(.horizontal, T.chromePadding).padding(.vertical, 12)
+            // T.accent is a static token, not an environment value: rebuilding is what makes
+            // a new accent reach views whose inputs did not otherwise change. The footer is
+            // left alone so the settings popout picking the accent stays open.
+            .id(theme.accent)
 
             Rectangle().fill(T.hairline).frame(height: 0.5)
 
@@ -245,6 +259,7 @@ struct Root: View {
                 }
             }
             .animation(nil, value: tab)
+            .id(theme.accent)
 
             Rectangle().fill(T.hairline).frame(height: 0.5)
             Footer(audio: audio, theme: theme)
@@ -252,14 +267,6 @@ struct Root: View {
         .frame(width: front.width)
         .frame(maxHeight: front.maxHeight)
         .environment(\.metrics, front)
-        .overlay(alignment: .bottom) {
-            if let notice = audio.notice {
-                Text(notice).font(front.mono).padding(.horizontal, 12).padding(.vertical, 7)
-                    .background(Capsule().fill(.ultraThinMaterial))
-                    .padding(.bottom, 48)
-                    .transition(.move(edge: .bottom).combined(with: .opacity))
-            }
-        }
         .onChange(of: audio.rackStatus) { _, s in if case .failed(let message) = s { audio.notice = message } }
     }
 
@@ -320,16 +327,35 @@ struct Footer: View {
 
     var body: some View {
         HStack(spacing: 10) {
-            Text(audio.scopeOn ? audio.scopeStatus.label : (audio.headerScope == .system ? "rack off" : "route off")).font(m.mono).foregroundStyle(.tertiary).lineLimit(1)
-            Spacer()
+            // Notices take the status slot for a few seconds instead of floating over the
+            // page, where they covered whatever control sat underneath.
+            if let notice = audio.notice {
+                HStack(spacing: 6) {
+                    Image(systemName: "info.circle.fill").font(.system(size: 10)).foregroundStyle(T.accent)
+                    Text(notice).font(.system(size: 11)).foregroundStyle(.primary).lineLimit(1).truncationMode(.middle)
+                }
+                .help(notice)
+                .transition(.opacity)
+            } else {
+                Text(audio.scopeOn ? audio.scopeStatus.label : (audio.headerScope == .system ? "rack off" : "route off"))
+                    .font(m.mono).foregroundStyle(.tertiary).lineLimit(1).truncationMode(.middle)
+                    .help(audio.rackOn ? audio.diagnostics.tapBinding : "")
+                    .transition(.opacity)
+            }
+            Spacer(minLength: 8)
             Button { showSettings.toggle() } label: {
                 Image(systemName: "gearshape").font(.system(size: 11)).foregroundStyle(.secondary).frame(width: 24, height: 22)
             }
             .buttonStyle(Press())
-            .popover(isPresented: $showSettings, arrowEdge: .bottom) { SettingsPopout(audio: audio, theme: theme) }
+            .help("Settings")
+            .popover(isPresented: $showSettings, arrowEdge: .bottom) {
+                SettingsPopout(audio: audio, theme: theme)
+            }
             Button("Quit") { NSApp.terminate(nil) }.font(.system(size: 11)).foregroundStyle(.tertiary).buttonStyle(.plain)
         }
-        .padding(.horizontal, 16).padding(.vertical, 9)
+        .frame(height: 22)
+        .padding(.horizontal, T.chromePadding).padding(.vertical, 8)
+        .animation(T.quick, value: audio.notice)
     }
 }
 
@@ -342,10 +368,6 @@ struct SettingsPopout: View {
         VStack(alignment: .leading, spacing: 14) {
             Text("Settings").font(.system(size: 13, weight: .semibold))
 
-            SettingGroup("Appearance") {
-                Picker("", selection: $theme.appearance) { ForEach(Theme.Appearance.allCases) { Text($0.title).tag($0) } }
-                    .labelsHidden().pickerStyle(.segmented).controlSize(.small)
-            }
             SettingGroup("Layout") {
                 Picker("", selection: $theme.density) { ForEach(Theme.Density.allCases) { Text($0.title).tag($0) } }
                     .labelsHidden().pickerStyle(.segmented).controlSize(.small)
@@ -439,22 +461,23 @@ struct FixTab: View {
 
     var body: some View {
         VStack(spacing: 0) {
-            SectionLabel(text: "Audio recovery").padding(.horizontal, m.gutter).padding(.top, m.sectionTop).padding(.bottom, m.sectionTop / 2)
+            SectionLabel(text: "Audio recovery").padding(.horizontal, T.rowInset + 10).padding(.top, m.sectionTop).padding(.bottom, m.sectionTop / 2)
             VStack(spacing: m.rowGap) {
                 FixRow(icon: "wrench.and.screwdriver.fill", title: "Fix audio", detail: "Reselect a real output and relaunch eqMac if it was routing", kind: .fix, audio: audio) { audio.fixAudio() }
                 FixRow(icon: "arrow.clockwise", title: "Restart eqMac", detail: "Kill and relaunch eqMac, restoring the hardware output first", kind: .restart, audio: audio) { audio.restartEqMac() }
                 FixRow(icon: "bolt.fill", title: "Reset Core Audio", detail: "Restart coreaudiod (asks for your password). Audio drops for ~3 s", kind: .reset, audio: audio) { audio.resetCA() }
             }
-            .padding(.horizontal, 10)
+            .padding(.horizontal, T.rowInset)
             HStack(spacing: 8) {
                 Circle().fill(audio.eqMacOn ? T.ok : Color.secondary.opacity(0.3)).frame(width: 6, height: 6)
-                Text(audio.eqMacOn ? "eqMac is running" : "eqMac is not running").font(m.mono).foregroundStyle(.tertiary)
-                Spacer()
+                Text(audio.eqMacOn ? "eqMac is running" : "eqMac is not running").font(m.mono).foregroundStyle(.tertiary).lineLimit(1).fixedSize()
+                Spacer(minLength: 12)
                 if let out = audio.currentOutput {
                     Text("default → \(out.name)").font(m.mono).foregroundStyle(out.isEqMac && !audio.eqMacOn ? T.warn : Color.secondary.opacity(0.5))
+                        .lineLimit(1).truncationMode(.middle).help(out.name)
                 }
             }
-            .padding(.horizontal, m.gutter).padding(.top, m.sectionTop)
+            .padding(.horizontal, T.rowInset + 10).padding(.top, m.sectionTop)
             Color.clear.frame(height: m.sectionTop)
         }
         .frame(maxWidth: .infinity, alignment: .top)
@@ -508,11 +531,15 @@ struct OutputTab: View {
 
     var body: some View {
         VStack(spacing: 0) {
-            SectionLabel(text: "Output devices").padding(.horizontal, m.gutter).padding(.top, m.sectionTop).padding(.bottom, m.sectionTop / 2)
+            SectionLabel(text: "Output devices").padding(.horizontal, T.rowInset + 10).padding(.top, m.sectionTop).padding(.bottom, m.sectionTop / 2)
             VStack(spacing: m.rowGap) {
-                ForEach(audio.outputs) { d in DeviceRow(device: d, isRackTarget: audio.rackOn && audio.rackTarget?.id == d.id) { audio.select(d) } }
+                ForEach(audio.outputs) { d in
+                    DeviceRow(device: d, isRackTarget: audio.rackOn && audio.rackTarget?.id == d.id, action: { audio.select(d) }) {
+                        if !d.isEqMac { DevicePresetTag(audio: audio, device: d) }
+                    }
+                }
             }
-            .padding(.horizontal, 10)
+            .padding(.horizontal, T.rowInset)
             if let vol = audio.outputVolume, audio.currentOutput?.isEqMac == false {
                 LevelRow(icon: "speaker.wave.2", value: Double(vol), muted: false, toggleMute: nil) { audio.setOutputVolume(Float($0)) }
                     .padding(.top, m.sectionTop - 2)
@@ -529,19 +556,19 @@ struct InputTab: View {
 
     var body: some View {
         VStack(spacing: 0) {
-            SectionLabel(text: "Input devices").padding(.horizontal, m.gutter).padding(.top, m.sectionTop).padding(.bottom, m.sectionTop / 2)
+            SectionLabel(text: "Input devices").padding(.horizontal, T.rowInset + 10).padding(.top, m.sectionTop).padding(.bottom, m.sectionTop / 2)
             VStack(spacing: m.rowGap) {
                 ForEach(audio.inputs) { d in
                     DeviceRow(device: d, isRackTarget: audio.micProcessing && audio.micSource?.id == d.id, isDefault: audio.micSource?.id == d.id) { audio.select(d) }
                 }
             }
-            .padding(.horizontal, 10)
+            .padding(.horizontal, T.rowInset)
             LevelRow(icon: "mic", value: Double(audio.inputVolume), muted: audio.micMuted, toggleMute: { audio.setMicMuted(!audio.micMuted) }) { audio.setInputVolume(Float($0)) }
                 .padding(.top, m.sectionTop - 2)
 
             if audio.virtualMicInstalled {
-                SectionLabel(text: "Microphone chain").padding(.horizontal, m.gutter).padding(.top, m.sectionTop + 4).padding(.bottom, m.sectionTop / 2)
-                MicSection(audio: audio).padding(.horizontal, 10)
+                SectionLabel(text: "Microphone chain").padding(.horizontal, T.rowInset + 10).padding(.top, m.sectionTop + 4).padding(.bottom, m.sectionTop / 2)
+                MicSection(audio: audio).padding(.horizontal, T.rowInset)
             }
             Color.clear.frame(height: m.sectionTop)
         }
@@ -565,7 +592,7 @@ struct MicSection: View {
                 ZStack {
                     Circle().fill(audio.micProcessing ? T.accent.opacity(0.9) : Color.primary.opacity(0.08))
                     Image(systemName: "waveform.and.mic").font(.system(size: 11, weight: .medium))
-                        .foregroundStyle(audio.micProcessing ? Color.black.opacity(0.8) : Color.primary.opacity(0.7))
+                        .foregroundStyle(audio.micProcessing ? T.onAccent : Color.primary.opacity(0.7))
                 }
                 .frame(width: m.badge, height: m.badge)
                 VStack(alignment: .leading, spacing: 2) {
@@ -640,20 +667,20 @@ struct RoutesTab: View {
                 .menuStyle(.borderlessButton).menuIndicator(.hidden).frame(width: 26)
                 .help("Route an app to a device")
             }
-            .padding(.leading, m.gutter).padding(.trailing, 8).padding(.top, m.sectionTop).padding(.bottom, m.sectionTop / 2)
+            .padding(.leading, T.rowInset + 10).padding(.trailing, T.rowInset + 2).padding(.top, m.sectionTop).padding(.bottom, m.sectionTop / 2)
 
             if audio.routes.isEmpty {
                 VStack(spacing: 6) {
-                    Image(systemName: "arrow.triangle.branch").font(.system(size: 20)).foregroundStyle(.quaternary)
-                    Text("Send one app to a different output.").font(m.mono).foregroundStyle(.tertiary)
-                    Text("Everything you do not route keeps using the system chain.").font(m.monoSmall).foregroundStyle(.quaternary)
+                    Image(systemName: "arrow.triangle.branch").font(.system(size: 20)).foregroundStyle(.tertiary)
+                    Text("Send one app to a different output.").font(.system(size: 12, weight: .medium)).foregroundStyle(.secondary)
+                    Text("Everything you do not route keeps using the system chain.").font(.system(size: 11)).foregroundStyle(.tertiary)
                 }
                 .frame(maxWidth: .infinity).padding(.vertical, m.sectionTop * 2)
             } else {
                 VStack(spacing: m.rowGap) {
                     ForEach(audio.routes) { route in RouteRow(route: route, audio: audio) }
                 }
-                .padding(.horizontal, 10)
+                .padding(.horizontal, T.rowInset)
                 .animation(T.quick, value: audio.routes.map(\.id))
             }
             Color.clear.frame(height: m.sectionTop)
@@ -739,7 +766,7 @@ struct RouteRow: View {
     }
 }
 
-struct DeviceRow: View {
+struct DeviceRow<Accessory: View>: View {
     @Environment(\.metrics) private var m
     let device: Device
     let isRackTarget: Bool
@@ -747,35 +774,84 @@ struct DeviceRow: View {
     /// the chain's source instead, since the default becomes the virtual mic while on.
     var isDefault: Bool? = nil
     let action: () -> Void
+    /// Trailing control with its own clicks (the output list's preset tag).
+    @ViewBuilder var accessory: Accessory
 
     var body: some View {
         let selected = isDefault ?? device.isDefault
-        Button(action: action) {
-            HStack(spacing: 12) {
-                ZStack {
-                    Circle().fill(selected ? T.accent.opacity(0.9) : Color.primary.opacity(0.08))
-                    Image(systemName: device.icon).font(.system(size: 12, weight: .medium))
-                        .foregroundStyle(selected ? Color.black.opacity(0.8) : Color.primary.opacity(0.7))
-                }
-                .frame(width: m.badge, height: m.badge)
-                if m.subtitle {
-                    VStack(alignment: .leading, spacing: 2) {
-                        Text(device.name).font(selected ? m.nameStrong : m.name).lineLimit(1)
-                        Text("\(device.formattedRate)  \(device.transportLabel)").font(m.monoSmall).foregroundStyle(.tertiary)
-                    }
-                } else {
-                    Text(device.name).font(selected ? m.nameStrong : m.name).lineLimit(1)
-                }
-                Spacer()
-                if !m.subtitle { Text(device.formattedRate).font(m.monoSmall).foregroundStyle(.tertiary) }
-                if isRackTarget { Image(systemName: "waveform").font(.system(size: 11)).foregroundStyle(T.accent) }
-                if selected { Image(systemName: "checkmark").font(.system(size: 10, weight: .semibold)).foregroundStyle(.secondary) }
+        HStack(spacing: 12) {
+            ZStack {
+                Circle().fill(selected ? T.accent.opacity(0.9) : Color.primary.opacity(0.08))
+                Image(systemName: device.icon).font(.system(size: 12, weight: .medium))
+                    .foregroundStyle(selected ? T.onAccent : Color.primary.opacity(0.7))
             }
-            .padding(.horizontal, 10).padding(.vertical, m.rowV)
-            .contentShape(Rectangle())
+            .frame(width: m.badge, height: m.badge)
+            VStack(alignment: .leading, spacing: 2) {
+                Text(device.name).font(selected ? m.nameStrong : m.name).lineLimit(1).truncationMode(.middle)
+                if m.subtitle {
+                    Text("\(device.formattedRate)  \(device.transportLabel)").font(m.monoSmall).foregroundStyle(.tertiary).lineLimit(1)
+                }
+            }
+            .help(device.name)
+            Spacer(minLength: 8)
+            accessory
+            if !m.subtitle { Text(device.formattedRate).font(m.monoSmall).foregroundStyle(.tertiary).fixedSize() }
+            Image(systemName: "waveform").font(.system(size: 11)).foregroundStyle(T.accent)
+                .opacity(isRackTarget ? 1 : 0).help("The rack processes this output")
+            Image(systemName: "checkmark").font(.system(size: 10, weight: .semibold)).foregroundStyle(.secondary)
+                .opacity(selected ? 1 : 0)
         }
-        .buttonStyle(Press())
+        .padding(.horizontal, 10).padding(.vertical, m.rowV)
+        .contentShape(Rectangle())
+        .onTapGesture(perform: action)
         .hoverRow(m.subtitle ? 8 : 6)
+    }
+}
+
+extension DeviceRow where Accessory == EmptyView {
+    init(device: Device, isRackTarget: Bool, isDefault: Bool? = nil, action: @escaping () -> Void) {
+        self.init(device: device, isRackTarget: isRackTarget, isDefault: isDefault, action: action) { EmptyView() }
+    }
+}
+
+/// The preset an output loads when it becomes active. Faint bookmark while unbound, the
+/// preset's name once bound; either way a menu to pick one.
+struct DevicePresetTag: View {
+    @Environment(\.metrics) private var m
+    @ObservedObject var audio: AudioState
+    let device: Device
+    @State private var hover = false
+
+    var body: some View {
+        let bound = audio.boundPreset(for: device.uid)
+        Hug(maxWidth: 140) {
+        Menu {
+            Section("Load on \(device.name)") {
+                Button { audio.bindPreset(nil, to: device) } label: {
+                    HStack { Text("No preset"); if bound == nil { Image(systemName: "checkmark") } }
+                }
+                ForEach(audio.presets) { p in
+                    Button { audio.bindPreset(p.id, to: device) } label: {
+                        HStack { Text(p.name); if bound?.id == p.id { Image(systemName: "checkmark") } }
+                    }
+                }
+            }
+            if audio.presets.isEmpty { Text("Save a preset from the rack first") }
+        } label: {
+            HStack(spacing: 4) {
+                Image(systemName: bound == nil ? "bookmark" : "bookmark.fill").font(.system(size: 9))
+                if let bound { Text(bound.name).font(.system(size: 10.5, weight: .medium)).lineLimit(1).truncationMode(.middle) }
+            }
+            .foregroundStyle(bound == nil ? AnyShapeStyle(.tertiary) : AnyShapeStyle(T.accent))
+        }
+        .menuStyle(.borderlessButton).menuIndicator(.hidden)
+        .tint(bound == nil ? Color.secondary : T.accent)
+        }
+        .padding(.horizontal, bound == nil ? 5 : 8).padding(.vertical, 3)
+        .background(Capsule().fill(bound == nil ? (hover ? T.hover : .clear) : T.accent.opacity(0.13)))
+        .opacity(bound == nil && !hover ? 0.6 : 1)
+        .onHover { hover = $0 }
+        .help(bound.map { "Loads “\($0.name)” when \(device.name) becomes the output" } ?? "Pick a preset to load when \(device.name) becomes the output")
     }
 }
 
@@ -793,20 +869,20 @@ struct LevelRow: View {
                 Button(action: toggleMute) {
                     Image(systemName: muted ? "mic.slash.fill" : "mic.fill")
                         .font(.system(size: 11, weight: .medium))
-                        .foregroundStyle(muted ? Color.black.opacity(0.85) : Color.primary.opacity(0.7))
-                        .frame(width: 28, height: 28)
+                        .foregroundStyle(muted ? Color.white : Color.primary.opacity(0.7))
+                        .frame(width: m.badge, height: m.badge)
                         .background(Circle().fill(muted ? T.warn : Color.primary.opacity(0.08)))
                 }
                 .buttonStyle(Press())
                 .help(muted ? "Unmute microphone" : "Mute microphone")
                 .animation(T.quick, value: muted)
             } else {
-                Image(systemName: icon).font(.system(size: 11)).foregroundStyle(.tertiary).frame(width: 28)
+                Image(systemName: icon).font(.system(size: 11)).foregroundStyle(.tertiary).frame(width: m.badge)
             }
             Fader(value: value, range: 0...1, label: { "\(Int(($0 * 100).rounded()))%" }, set: set).opacity(muted ? 0.4 : 1)
             Text(muted ? "muted" : "\(Int((value * 100).rounded()))%").font(m.mono).foregroundStyle(.secondary).frame(width: 44, alignment: .trailing)
         }
-        .padding(.horizontal, m.gutter)
+        .padding(.horizontal, T.rowInset + 10)
     }
 }
 
@@ -1039,6 +1115,7 @@ struct RackTab: View {
     var body: some View {
         let editorWidth = chainOpen ? m.width - m.chainW - 0.5 : m.width
         VStack(spacing: 0) {
+            if !audio.scopeOn { OffBanner(audio: audio) }
             HStack(spacing: 0) {
                 if chainOpen {
                     ChainColumn(audio: audio)
@@ -1050,9 +1127,8 @@ struct RackTab: View {
                     if showGraph && active {
                         Graph(audio: audio)
                             .frame(height: m.faderH + 40)
-                            .padding(.horizontal, m.gutter).padding(.vertical, m.gap)
+                            .padding(.horizontal, m.gutter).padding(.top, m.sectionTop).padding(.bottom, 2)
                             .transition(.opacity)
-                        Rectangle().fill(T.hairline).frame(height: 0.5)
                     }
                     ModuleEditor(audio: audio, chainOpen: chainOpen)
                 }
@@ -1063,26 +1139,26 @@ struct RackTab: View {
             .clipped()
             Rectangle().fill(T.hairline).frame(height: 0.5)
 
-            HStack(spacing: 12) {
-                MeterPair(meters: audio.meters)
+            HStack(spacing: 6) {
                 IconButton("sidebar.left", active: chainOpen) { withAnimation(T.quick) { chainOpen.toggle() } }
                     .help(chainOpen ? "Hide chain" : "Show chain")
                 IconButton("waveform.path.ecg", active: showGraph) { withAnimation(T.quick) { showGraph.toggle() } }
                     .help(showGraph ? "Hide graph" : "Show response and spectrum")
                 Button { audio.setBypass(!audio.rack.bypass) } label: {
                     Text("Bypass").font(.system(size: 11, weight: .medium))
-                        .foregroundStyle(audio.rack.bypass ? Color.black.opacity(0.85) : .secondary)
-                        .padding(.horizontal, 10).padding(.vertical, 4)
+                        .foregroundStyle(audio.rack.bypass ? T.onAccent : .secondary)
+                        .padding(.horizontal, 10).frame(height: 22)
                         .background(Capsule().fill(audio.rack.bypass ? T.accent : T.card))
                         .overlay(Capsule().strokeBorder(T.hairline, lineWidth: 0.5))
                         .fixedSize()
                 }
                 .buttonStyle(Press())
+                .help("Hear the unprocessed signal (A/B)")
                 .animation(T.quick, value: audio.rack.bypass)
-                Spacer(minLength: 4)
-                if m.subtitle && audio.rackOn {
-                    Text(audio.diagnostics.tapBinding).font(m.monoSmall).foregroundStyle(.tertiary).lineLimit(1)
-                }
+                .padding(.leading, 4)
+                Spacer(minLength: 8)
+                MeterPair(meters: audio.meters)
+                Spacer(minLength: 8)
                 Menu {
                     ForEach(audio.outputRates, id: \.self) { r in
                         Button { audio.setSampleRate(r) } label: {
@@ -1094,7 +1170,7 @@ struct RackTab: View {
                         Text(rateLabel(audio.rackTarget?.rate ?? 0)).font(m.mono).foregroundStyle(.secondary)
                         Image(systemName: "chevron.up.chevron.down").font(.system(size: 8, weight: .semibold)).foregroundStyle(.tertiary)
                     }
-                    .padding(.horizontal, 7).padding(.vertical, 3)
+                    .padding(.horizontal, 8).frame(height: 22)
                     .background(Capsule().fill(T.card))
                     .overlay(Capsule().strokeBorder(T.hairline, lineWidth: 0.5))
                 }
@@ -1103,7 +1179,7 @@ struct RackTab: View {
                 .disabled(audio.outputRates.count < 2)
                 IconButton("arrow.uturn.backward") { audio.resetRack() }.help("Reset rack")
             }
-            .padding(.horizontal, m.gutter).padding(.vertical, m.rowV + 3)
+            .padding(.horizontal, m.gutter - 4).padding(.vertical, 8)
         }
         .presetPrompt(audio: audio)
     }
@@ -1113,27 +1189,69 @@ struct RackTab: View {
     }
 }
 
+/// Edits on a chain that is off are silent; say so where the editing happens.
+struct OffBanner: View {
+    @ObservedObject var audio: AudioState
+    var body: some View {
+        HStack(spacing: 8) {
+            Image(systemName: "speaker.slash").font(.system(size: 10, weight: .semibold)).foregroundStyle(.secondary)
+            Text(audio.headerScope == .system ? "Rack is off. Changes are saved but not heard." : "This chain is off. Changes are saved but not heard.")
+                .font(.system(size: 11)).foregroundStyle(.secondary).lineLimit(1).truncationMode(.tail)
+            Spacer(minLength: 8)
+            Button("Turn on") { audio.setScopeOn(true) }
+                .buttonStyle(.plain).font(.system(size: 11, weight: .semibold)).foregroundStyle(T.accent)
+                .disabled(audio.active != nil)
+        }
+        .padding(.horizontal, T.chromePadding).frame(height: 30)
+        .background(T.accent.opacity(0.08))
+        .overlay(alignment: .bottom) { Rectangle().fill(T.hairline).frame(height: 0.5) }
+    }
+}
+
 // MARK: - Presets
 
-/// Which preset the chain came from, with a dot once it has been edited past it.
-struct PresetChip: View {
+/// Which preset the chain came from (a dot once it has been edited past it) and, on the
+/// system chain, whether the current output loads it automatically.
+struct PresetBar: View {
     @ObservedObject var audio: AudioState
+    @State private var hover = false
 
     var body: some View {
-        Chip {
-            Menu { PresetMenuItems(audio: audio) } label: {
-                HStack(spacing: 5) {
-                    Image(systemName: "bookmark").font(.system(size: 10))
-                    Text(audio.currentPreset?.name ?? "Preset").font(.system(size: 11, weight: .medium)).lineLimit(1)
-                    if audio.presetModified {
-                        Image(systemName: "circle.fill").font(.system(size: 5)).foregroundStyle(T.accent)
+        let current = audio.currentPreset
+        let device = audio.rackScope == .system ? audio.rackTarget : nil
+        let bound = device.map { audio.boundPreset(for: $0.uid) } ?? nil
+        Menu { PresetMenuItems(audio: audio) } label: {
+            HStack(spacing: 7) {
+                Image(systemName: current == nil ? "bookmark" : "bookmark.fill").font(.system(size: 10))
+                    .foregroundStyle(current == nil ? AnyShapeStyle(.tertiary) : AnyShapeStyle(T.accent))
+                    .frame(width: 14)
+                VStack(alignment: .leading, spacing: 1) {
+                    HStack(spacing: 4) {
+                        Text(current?.name ?? "No preset").font(.system(size: 11.5, weight: .medium)).lineLimit(1).truncationMode(.tail)
+                            .foregroundStyle(current == nil ? .secondary : .primary)
+                        if audio.presetModified {
+                            Circle().fill(T.accent).frame(width: 5, height: 5).help("Edited since the preset was applied")
+                        }
+                    }
+                    if let device, let bound {
+                        Text(bound.id == current?.id ? "auto-loads on this output" : "this output loads “\(bound.name)”")
+                            .font(.system(size: 9.5)).foregroundStyle(.tertiary).lineLimit(1).truncationMode(.tail)
                     }
                 }
-                .foregroundStyle(audio.currentPreset == nil ? .secondary : .primary)
+                Spacer(minLength: 0)
+                Image(systemName: "chevron.up.chevron.down").font(.system(size: 8, weight: .semibold)).foregroundStyle(.tertiary)
             }
-            .menuStyle(.borderlessButton).menuIndicator(.visible)
+            .padding(.horizontal, 8).padding(.vertical, 6)
+            .frame(maxWidth: .infinity, alignment: .leading)
+            .background(RoundedRectangle(cornerRadius: 7).fill(hover ? T.hover : T.card))
+            .overlay(RoundedRectangle(cornerRadius: 7).strokeBorder(T.hairline, lineWidth: 0.5))
+            .contentShape(Rectangle())
         }
-        .help(audio.presetModified ? "Chain edited since the preset was applied" : "Presets: named chains you can recall on any device")
+        // Button-style menu with a plain button draws the label as laid out; the borderless
+        // style would reduce it to its text and icon.
+        .menuStyle(.button).buttonStyle(.plain).menuIndicator(.hidden)
+        .onHover { hover = $0 }
+        .help(current.map { "Preset “\($0.name)”" } ?? "Presets: named chains you can recall and bind to an output")
     }
 }
 
@@ -1141,13 +1259,14 @@ struct PresetMenuItems: View {
     @ObservedObject var audio: AudioState
 
     var body: some View {
+        let device = audio.rackScope == .system ? audio.rackTarget : nil
         if audio.presets.isEmpty {
             Text("No presets yet")
         }
         ForEach(audio.presets) { preset in
             Button { audio.applyPreset(preset) } label: {
                 HStack {
-                    Text(preset.device.map { "\(preset.name) · \($0)" } ?? preset.name)
+                    Text(preset.name)
                     if preset.id == audio.rack.preset { Image(systemName: audio.presetModified ? "circle.fill" : "checkmark") }
                 }
             }
@@ -1157,14 +1276,21 @@ struct PresetMenuItems: View {
         if let current = audio.currentPreset {
             Button("Update “\(current.name)”") { audio.updatePreset() }.disabled(!audio.presetModified)
             Button("Rename…") { audio.presetPrompt = .rename(current.id) }
-            if let device = audio.rackTarget?.name, audio.rackScope == .system {
-                Button {
-                    audio.rememberPreset(current.id, forDevice: current.device != device)
-                } label: {
-                    HStack { Text("Auto-select for \(device)"); if current.device == device { Image(systemName: "checkmark") } }
+            Button("Delete “\(current.name)”", role: .destructive) { audio.deletePreset(current.id) }
+        }
+        if let device, !audio.presets.isEmpty {
+            Divider()
+            Menu("Load on \(device.name)") {
+                let bound = audio.boundPreset(for: device.uid)
+                Button { audio.bindPreset(nil, to: device) } label: {
+                    HStack { Text("No preset"); if bound == nil { Image(systemName: "checkmark") } }
+                }
+                ForEach(audio.presets) { p in
+                    Button { audio.bindPreset(p.id, to: device) } label: {
+                        HStack { Text(p.name); if bound?.id == p.id { Image(systemName: "checkmark") } }
+                    }
                 }
             }
-            Button("Delete “\(current.name)”", role: .destructive) { audio.deletePreset(current.id) }
         }
     }
 }
@@ -1276,7 +1402,7 @@ struct ChainColumn: View {
             } else {
                 SectionLabel(text: "Chain").padding(.horizontal, m.gutter - 4).padding(.top, m.sectionTop).padding(.bottom, m.gap)
             }
-            PresetChip(audio: audio).padding(.horizontal, m.gutter - 4).padding(.bottom, m.gap)
+            PresetBar(audio: audio).padding(.horizontal, m.gutter - 4).padding(.bottom, m.gap)
 
             ScrollView(showsIndicators: false) {
                 VStack(spacing: 4) {
@@ -1326,11 +1452,11 @@ struct ChainColumn: View {
             } label: {
                 HStack(spacing: 6) {
                     Image(systemName: "plus").font(.system(size: 10, weight: .semibold))
-                    Text("Add").font(.system(size: 11.5, weight: .medium))
+                    Text("Add module").font(.system(size: 11.5, weight: .medium))
                 }
                 .foregroundStyle(.secondary)
                 .frame(maxWidth: .infinity)
-                .frame(height: m.chainRowH)
+                .frame(height: 30)
                 .background(RoundedRectangle(cornerRadius: 7).fill(T.card))
                 .overlay(RoundedRectangle(cornerRadius: 7).strokeBorder(T.hairline, lineWidth: 0.5))
             }
@@ -1358,8 +1484,13 @@ struct ChainRow: View {
             .help(module.enabled ? "Bypass this module" : "Enable this module")
             Image(systemName: module.kind.symbol).font(.system(size: 10)).foregroundStyle(selected ? .primary : .secondary)
                 .frame(width: 14)
-            Text(module.title).font(.system(size: 11.5, weight: selected ? .semibold : .medium)).lineLimit(1)
-                .foregroundStyle(module.enabled ? .primary : .secondary)
+            VStack(alignment: .leading, spacing: 1) {
+                Text(module.displayName).font(.system(size: 11.5, weight: selected ? .semibold : .medium)).lineLimit(1).truncationMode(.tail)
+                    .foregroundStyle(module.enabled ? .primary : .secondary)
+                if let caption = module.caption {
+                    Text(caption).font(.system(size: 9.5)).foregroundStyle(.tertiary).lineLimit(1).truncationMode(.tail)
+                }
+            }
             Spacer(minLength: 0)
         }
         .padding(.horizontal, 8)
@@ -1371,9 +1502,32 @@ struct ChainRow: View {
         .contentShape(Rectangle())
         .onTapGesture(perform: select)
         .onHover { hover = $0 }
+        .help(module.title)
         .animation(T.hoverAnim, value: hover)
         .animation(T.quick, value: selected)
         .animation(T.quick, value: lifted)
+    }
+}
+
+extension RackModule {
+    /// Profile modules are named "<source> · … · <headphone>": the headphone is what you
+    /// look for in the chain, the source is detail.
+    var displayName: String {
+        guard let name, let last = name.components(separatedBy: " · ").last else { return kind.title }
+        return last
+    }
+
+    /// Second line under the name: where a profile came from and what the module is, or a
+    /// short summary for EQs.
+    var caption: String? {
+        if let name {
+            let parts = name.components(separatedBy: " · ").dropLast()
+            return (parts.isEmpty ? [kind.title] : Array(parts) + [kind.title]).joined(separator: " · ")
+        }
+        switch kind {
+        case .parametricEQ: return bands.isEmpty ? "no filters" : "\(bands.count) filter\(bands.count == 1 ? "" : "s")"
+        default: return kind.group
+        }
     }
 }
 
@@ -1396,13 +1550,19 @@ struct ModuleEditor: View {
                     .help(module.enabled ? "Bypass this module" : "Enable this module")
                     if chainOpen {
                         Image(systemName: module.kind.symbol).font(.system(size: 12)).foregroundStyle(T.accent)
-                        Text(module.title).font(.system(size: 13, weight: .semibold)).lineLimit(1)
+                        VStack(alignment: .leading, spacing: 1) {
+                            Text(module.displayName).font(.system(size: 13, weight: .semibold)).lineLimit(1).truncationMode(.middle)
+                            if let caption = module.caption {
+                                Text(caption).font(.system(size: 10)).foregroundStyle(.tertiary).lineLimit(1).truncationMode(.tail)
+                            }
+                        }
+                        .help(module.title)
                     } else {
                         Hug {
                             Menu {
                                 ForEach(audio.rack.modules) { other in
                                     Button { audio.selectedModule = other.id } label: {
-                                        HStack { Label(other.title, systemImage: other.kind.symbol); if other.id == module.id { Image(systemName: "checkmark") } }
+                                        HStack { Label(other.displayName, systemImage: other.kind.symbol); if other.id == module.id { Image(systemName: "checkmark") } }
                                     }
                                 }
                                 Divider()
@@ -1419,16 +1579,15 @@ struct ModuleEditor: View {
                             } label: {
                                 HStack(spacing: 6) {
                                     Image(systemName: module.kind.symbol).font(.system(size: 12)).foregroundStyle(T.accent)
-                                    Text(module.title).font(.system(size: 13, weight: .semibold)).lineLimit(1)
+                                    Text(module.displayName).font(.system(size: 13, weight: .semibold)).lineLimit(1).truncationMode(.middle)
                                 }
                             }
                             .menuStyle(.borderlessButton).menuIndicator(.visible)
                         }
                         .padding(.leading, 6).padding(.trailing, 2).padding(.vertical, 3)
                         .background(RoundedRectangle(cornerRadius: 6).fill(T.card))
-                        .help("Which module to edit")
+                        .help(module.title)
                     }
-                    if module.name != nil { Text(module.kind.title).font(m.monoSmall).foregroundStyle(.tertiary).lineLimit(1).fixedSize() }
                     Spacer(minLength: 4)
                     IconButton("arrow.counterclockwise") { audio.resetModule(module.id) }.help("Reset module")
                     IconButton("trash") { audio.removeModule(module.id) }.help("Remove module")
@@ -1488,12 +1647,13 @@ struct Graph: View {
     private static let points = 160
 
     var body: some View {
+        let sr = max(8_000, audio.rackTarget?.rate ?? 48_000)
         let chain = (0..<Self.points).map { i -> Double in
-            audio.rack.responseDB(at: Self.frequency(at: Double(i) / Double(Self.points - 1)))
+            audio.rack.responseDB(at: Self.frequency(at: Double(i) / Double(Self.points - 1)), sampleRate: sr)
         }
         let selected: [Double]? = audio.selected.flatMap { module in
-            module.linearCascade == nil || audio.rack.modules.filter({ $0.enabled && $0.linearCascade != nil }).count < 2 ? nil
-                : (0..<Self.points).map { i in module.responseDB(at: Self.frequency(at: Double(i) / Double(Self.points - 1))) }
+            module.linearCascade(sampleRate: sr) == nil || audio.rack.modules.filter({ $0.enabled && $0.linearCascade(sampleRate: sr) != nil }).count < 2 ? nil
+                : (0..<Self.points).map { i in module.responseDB(at: Self.frequency(at: Double(i) / Double(Self.points - 1)), sampleRate: sr) }
         }
         let range = max(6, (chain + (selected ?? [])).map { abs($0) }.max() ?? 0).rounded(.up)
         let spectrum = meters.spectrum
@@ -1625,20 +1785,32 @@ struct BandColumns: View {
     let setGain: (UUID, Double) -> Void
 
     var body: some View {
-        // Each column needs ~34 pt for its labels; past what the editor column can hold,
-        // switch to fixed-width columns that scroll sideways.
-        let available = editorWidth - 2 * m.gutter - 12
-        let dense = CGFloat(bands.count) * 34 > available
-        let columns = HStack(alignment: .bottom, spacing: dense ? 4 : 6) {
-            ForEach(bands) { band in
-                BandColumn(band: band, selected: band.id == selected, height: height,
-                           select: { select(band.id) }, setGain: { setGain(band.id, $0) })
-                    .frame(width: dense ? 30 : nil).frame(maxWidth: dense ? nil : .infinity)
+        // Columns share the editor width down to 28 pt each (enough for "10.3k"); past that
+        // they keep 28 pt and the row scrolls. One ScrollView either way, so adding a band
+        // never swaps the view out from under the pointer.
+        let spacing: CGFloat = 2, inset: CGFloat = 6
+        let available = editorWidth - 2 * m.gutter - 2 * inset
+        let n = CGFloat(max(bands.count, 1))
+        let width = max(28, min(56, (available - spacing * (n - 1)) / n))
+        let overflow = width * n + spacing * (n - 1) > available + 0.5
+        ScrollView(.horizontal, showsIndicators: overflow) {
+            HStack(alignment: .bottom, spacing: spacing) {
+                ForEach(bands) { band in
+                    BandColumn(band: band, selected: band.id == selected, height: height,
+                               select: { select(band.id) }, setGain: { setGain(band.id, $0) })
+                        .frame(width: width)
+                }
             }
+            .padding(.vertical, 8).padding(.horizontal, inset)
+            .frame(minWidth: available + 2 * inset, alignment: .center)
         }
-        .padding(.vertical, 8).padding(.horizontal, 6)
-        Group {
-            if dense { ScrollView(.horizontal, showsIndicators: false) { columns } } else { columns }
+        .scrollDisabled(!overflow)
+        .mask {
+            HStack(spacing: 0) {
+                LinearGradient(colors: [.clear, .black], startPoint: .leading, endPoint: .trailing).frame(width: overflow ? 10 : 0)
+                Rectangle()
+                LinearGradient(colors: [.black, .clear], startPoint: .leading, endPoint: .trailing).frame(width: overflow ? 10 : 0)
+            }
         }
         .background(RoundedRectangle(cornerRadius: 9).fill(T.card))
         .overlay {
@@ -1649,6 +1821,11 @@ struct BandColumns: View {
 
 struct BandColumn: View {
     @Environment(\.metrics) private var m
+    /// Whole dB with a sign; anything that rounds to zero is "0", never "-0".
+    static func gainLabel(_ db: Double) -> String {
+        let r = db.rounded()
+        return r == 0 ? "0" : String(format: "%+.0f", r)
+    }
     let band: EQBand
     let selected: Bool
     let height: CGFloat
@@ -1657,7 +1834,7 @@ struct BandColumn: View {
 
     var body: some View {
         VStack(spacing: 5) {
-            Text(band.type.usesGain ? String(format: "%+.0f", band.gainDB) : "·")
+            Text(band.type.usesGain ? Self.gainLabel(band.gainDB) : "·")
                 .font(m.monoSmall).foregroundStyle(selected ? .primary : .tertiary).lineLimit(1)
             VFader(value: band.gainDB, range: -18...18, label: { String(format: "%+.1f dB", $0) }) { setGain(($0 * 2).rounded() / 2) }
                 .frame(height: height)
@@ -1743,8 +1920,8 @@ struct AutoEQResults: View {
                                 Button { audio.applyAutoEQ(e); done() } label: {
                                     HStack {
                                         VStack(alignment: .leading, spacing: 2) {
-                                            Text(e.title).font(.system(size: 12)).lineLimit(1)
-                                            Text(e.subtitle).font(m.monoSmall).foregroundStyle(.tertiary)
+                                            Text(e.title).font(.system(size: 12)).lineLimit(1).truncationMode(.middle)
+                                            Text(e.subtitle).font(m.monoSmall).foregroundStyle(.tertiary).lineLimit(1)
                                         }
                                         Spacer()
                                     }
@@ -1775,6 +1952,44 @@ struct Chip<Content: View>: View {
     }
 }
 
+/// Left-to-right rows that wrap, each child at its ideal width capped to the row, so a
+/// long target name moves to the next line instead of pushing the chips off the edge.
+struct Flow: Layout {
+    var spacing: CGFloat = 6
+
+    private func rows(_ subviews: Subviews, width: CGFloat) -> [[(Int, CGSize)]] {
+        var rows: [[(Int, CGSize)]] = [[]], x: CGFloat = 0
+        for (i, s) in subviews.enumerated() {
+            let size = s.sizeThatFits(ProposedViewSize(width: width, height: nil))
+            if x > 0, x + size.width > width { rows.append([]); x = 0 }
+            rows[rows.count - 1].append((i, size))
+            x += size.width + spacing
+        }
+        return rows
+    }
+
+    func sizeThatFits(proposal: ProposedViewSize, subviews: Subviews, cache: inout ()) -> CGSize {
+        let width = proposal.width ?? .infinity
+        let rs = rows(subviews, width: width)
+        let h = rs.reduce(0) { $0 + ($1.map(\.1.height).max() ?? 0) } + spacing * CGFloat(max(0, rs.count - 1))
+        let w = rs.map { $0.reduce(0) { $0 + $1.1.width } + spacing * CGFloat(max(0, $0.count - 1)) }.max() ?? 0
+        return CGSize(width: proposal.width ?? w, height: h)
+    }
+
+    func placeSubviews(in bounds: CGRect, proposal: ProposedViewSize, subviews: Subviews, cache: inout ()) {
+        var y = bounds.minY
+        for row in rows(subviews, width: bounds.width) {
+            var x = bounds.minX
+            let h = row.map(\.1.height).max() ?? 0
+            for (i, size) in row {
+                subviews[i].place(at: CGPoint(x: x, y: y + (h - size.height) / 2), anchor: .topLeading, proposal: ProposedViewSize(size))
+                x += size.width + spacing
+            }
+            y += h + spacing
+        }
+    }
+}
+
 /// Source, filter count and (for squig.link) target for the profile search.
 struct ProfileChips: View {
     @ObservedObject var audio: AudioState
@@ -1783,7 +1998,7 @@ struct ProfileChips: View {
     init(audio: AudioState) { self.audio = audio; self.squig = audio.squig }
 
     var body: some View {
-        HStack(spacing: 6) {
+        Flow(spacing: 6) {
             Chip {
                 Menu {
                     Button { audio.profileSource = .autoEQ } label: {
@@ -1872,7 +2087,7 @@ struct SquigResults: View {
                                     Button { audio.applySquig(e); done() } label: {
                                         HStack {
                                             VStack(alignment: .leading, spacing: 2) {
-                                                Text(e.title).font(.system(size: 12)).lineLimit(1)
+                                                Text(e.title).font(.system(size: 12)).lineLimit(1).truncationMode(.middle)
                                                 Text(catalog.database?.title ?? "").font(m.monoSmall).foregroundStyle(.tertiary)
                                             }
                                             Spacer()
@@ -1904,7 +2119,7 @@ struct GraphicEditor: View {
             HStack(alignment: .bottom, spacing: 6) {
                 ForEach(module.bands) { band in
                     VStack(spacing: 6) {
-                        Text(String(format: "%+.0f", band.gainDB)).font(m.monoSmall).foregroundStyle(.tertiary)
+                        Text(BandColumn.gainLabel(band.gainDB)).font(m.monoSmall).foregroundStyle(.tertiary)
                         VFader(value: band.gainDB, range: -12...12, label: { String(format: "%+.1f dB", $0) }) { g in audio.setBand(module.id, band.id) { $0.gainDB = (g * 2).rounded() / 2 } }
                             .frame(height: 160)
                         Text(band.frequency >= 1000 ? String(format: "%.0fk", band.frequency / 1000) : String(format: "%.0f", band.frequency))
