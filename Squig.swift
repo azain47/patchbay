@@ -4,6 +4,7 @@ import Foundation
 /// deployment: `phone_book.json` lists the phones, `config.js` names the target
 /// curves, and `data/<file> L.txt` / `R.txt` hold REW-style frequency responses.
 /// Sites that opted out of cross-site listing (Hangout.Audio among them) are skipped.
+/// Two ways to search: one selected database, or every listed database at once.
 final class SquigCatalog: ObservableObject {
     struct Database: Identifiable, Hashable, Codable {
         let site: String
@@ -30,6 +31,32 @@ final class SquigCatalog: ObservableObject {
         var id: String { name }
     }
 
+    /// A phone in a particular database; the same model often appears in several.
+    struct Hit: Identifiable, Hashable {
+        let db: Database
+        let entry: Entry
+        var id: String { db.id + "|" + entry.file }
+    }
+
+    /// What a database's page config says: its target curves and where its data lives.
+    private struct Resolved {
+        let targets: [Target]
+        /// Folder holding `<file> L.txt`, relative to the database folder.
+        let phoneDir: String
+        /// Folders tried, in order, for `<target> Target.txt`.
+        let targetDirs: [String]
+        /// Measurement files are `<file> <channel><sample>.txt`, e.g. `X L.txt` or `X R2.txt`.
+        let channels: [String]
+        let samples: [String]
+    }
+
+    /// Which kind of curve to correct towards when the database is not narrowed down.
+    enum Style: String, CaseIterable, Identifiable {
+        case harman, neutral
+        var id: String { rawValue }
+        var title: String { self == .harman ? "Harman" : "Neutral" }
+    }
+
     enum State: Equatable { case idle, loading, ready(Int), failed(String) }
 
     @Published private(set) var databases: [Database] = []
@@ -38,9 +65,21 @@ final class SquigCatalog: ObservableObject {
     @Published private(set) var targets: [Target] = []
     @Published private(set) var target: Target?
     @Published private(set) var state: State = .idle
-    private var dataDir = "data/"
-    /// Cache-file stem for the selected database.
-    private var key: String { database.map { $0.site + "-" + $0.type.lowercased().filter(\.isLetter) } ?? "none" }
+    /// Every-database index: phone books loaded so far, out of how many.
+    @Published private(set) var books: [String: [Entry]] = [:]
+    @Published private(set) var indexed = 0
+    @Published private(set) var indexTotal = 0
+    private var indexing = false
+    private var resolved: [String: Resolved] = [:]
+    private var siteWaiters: [() -> Void] = []
+    private var sitesLoading = false
+
+    /// Cache-file stem for a database, shared by single and every-database loading. The
+    /// folder is part of it: one site can host several databases of the same type.
+    private static func key(_ db: Database) -> String {
+        let folder = db.folder.path.lowercased().filter { $0.isLetter || $0.isNumber }
+        return db.site + "-" + db.type.lowercased().filter { $0.isLetter || $0.isNumber } + (folder.isEmpty ? "" : "-" + folder)
+    }
 
     private static let sitesJSON = URL(string: "https://squig.link/squigsites.json")!
     private static let sitesJS = URL(string: "https://squig.link/squigsites.js")!
@@ -56,14 +95,23 @@ final class SquigCatalog: ObservableObject {
 
     // MARK: Sites
 
-    func loadSites() {
-        guard databases.isEmpty else { return }
+    func loadSites(then done: (() -> Void)? = nil) {
+        guard databases.isEmpty else { done?(); return }
+        if let done { siteWaiters.append(done) }
+        guard !sitesLoading else { return }
+        sitesLoading = true
         Self.fetch(Self.sitesJS, cache: "squig-sites.js") { [weak self] jsResult in
             let optedOut = (try? jsResult.get()).flatMap(Self.parseOptedOut) ?? Self.knownOptedOut
             Self.fetch(Self.sitesJSON, cache: "squig-sites.json") { jsonResult in
-                guard let data = try? jsonResult.get() else { return }
-                let parsed = Self.parseSites(data, optedOut: optedOut)
-                DispatchQueue.main.async { self?.databases = parsed }
+                let parsed = (try? jsonResult.get()).map { Self.parseSites($0, optedOut: optedOut) } ?? []
+                DispatchQueue.main.async {
+                    guard let self else { return }
+                    self.sitesLoading = false
+                    self.databases = parsed
+                    let waiters = self.siteWaiters
+                    self.siteWaiters = []
+                    waiters.forEach { $0() }
+                }
             }
         }
     }
@@ -103,43 +151,101 @@ final class SquigCatalog: ObservableObject {
     func select(_ db: Database) {
         database = db
         if let data = try? JSONEncoder().encode(db) { UserDefaults.standard.set(data, forKey: "squig.database") }
-        entries = []; targets = []; target = nil
+        entries = []; targets = []; target = nil; state = .idle
         load()
     }
 
     func load() {
         guard let db = database, state != .loading, entries.isEmpty else { return }
         state = .loading
-        let key = key
-        Self.fetch(db.folder.appendingPathComponent("phone_book.json"), cache: "squig-\(key)-book.json") { [weak self] bookResult in
+        loadBook(db) { [weak self] book in
+            guard let self, self.database == db else { return }
+            guard let book else { self.state = .failed("phone book unavailable"); return }
+            self.resolve(db) { r in
+                guard self.database == db else { return }
+                self.entries = book
+                self.targets = r.targets
+                self.target = self.candidates(for: db, among: r.targets, style: nil).first
+                self.state = .ready(book.count)
+            }
+        }
+    }
+
+    /// Loads every listed database's phone book, a few at a time; results appear in
+    /// `books` as they arrive. A database that fails is skipped.
+    func loadAll() {
+        guard !indexing, indexTotal == 0 || indexed < indexTotal else { return }
+        indexing = true
+        loadSites { [weak self] in
             guard let self else { return }
-            guard let book = try? bookResult.get() else {
-                DispatchQueue.main.async { self.state = .failed("phone book unavailable") }; return
-            }
-            let parsed = Self.parseBook(book)
-            Self.configURL(for: db, cache: "squig-\(key)-index.html") { configURL in
-                let finish: (Data?) -> Void = { config in
-                    let text = config.flatMap { String(data: $0, encoding: .utf8) } ?? ""
-                    let targets = Self.parseTargets(text)
-                    let dir = Self.parseDataDir(text)
-                    DispatchQueue.main.async {
-                        self.entries = parsed
-                        self.targets = targets
-                        self.dataDir = dir
-                        let remembered = UserDefaults.standard.string(forKey: "squig.target.\(db.id)")
-                        self.target = targets.first { $0.name == remembered } ?? Self.defaultTarget(targets)
-                        self.state = .ready(parsed.count)
-                    }
+            let pending = self.databases.filter { self.books[$0.id] == nil }
+            self.indexTotal = self.databases.count
+            self.indexed = self.databases.count - pending.count
+            var queue = pending[...]
+            func next() {
+                guard let db = queue.popFirst() else { return }
+                self.loadBook(db) { book in
+                    if let book { self.books[db.id] = book }
+                    self.indexed += 1
+                    if self.indexed >= self.indexTotal { self.indexing = false }
+                    next()
                 }
-                guard let configURL else { finish(nil); return }
-                Self.fetch(configURL, cache: "squig-\(key)-config.js") { finish(try? $0.get()) }
             }
+            if pending.isEmpty { self.indexing = false }
+            for _ in 0..<min(6, pending.count) { next() }
         }
     }
 
     func setTarget(_ t: Target) {
         target = t
         if let db = database { UserDefaults.standard.set(t.name, forKey: "squig.target.\(db.id)") }
+    }
+
+    /// Targets to try for a database, best first. Narrowed to one database (`style` nil)
+    /// the target you picked there comes first; searching everywhere, the style decides.
+    private func candidates(for db: Database, among targets: [Target], style: Style?) -> [Target] {
+        let book = books[db.id] ?? (db == database ? entries : [])
+        let phones = Set(book.flatMap { [$0.title.lowercased(), $0.file.lowercased(), "\($0.brand) \($0.model)".lowercased()] })
+        let ranked = Self.ranked(targets, for: db, style: style ?? .harman, phones: phones)
+        guard style == nil, let remembered = UserDefaults.standard.string(forKey: "squig.target.\(db.id)"),
+              let picked = targets.first(where: { $0.name == remembered }) else { return ranked }
+        return [picked] + ranked.filter { $0 != picked }
+    }
+
+    /// Phone book for one database; calls back on the main queue. Most sites keep it in
+    /// `data/` beside the measurements, a few at the site root.
+    private func loadBook(_ db: Database, completion: @escaping ([Entry]?) -> Void) {
+        if let book = books[db.id] { completion(book); return }
+        let cache = "squig-\(Self.key(db))-book.json"
+        let finish: (Result<Data, Error>) -> Void = { result in
+            let book = (try? result.get()).flatMap { data -> [Entry]? in
+                let parsed = Self.parseBook(data)
+                return parsed.isEmpty ? nil : parsed
+            }
+            DispatchQueue.main.async { completion(book) }
+        }
+        Self.fetch(db.folder.appendingPathComponent("data/phone_book.json"), cache: cache) { result in
+            if (try? result.get()).map(Self.parseBook)?.isEmpty == false { finish(result); return }
+            Self.fetch(db.folder.appendingPathComponent("phone_book.json"), cache: cache, refresh: true, completion: finish)
+        }
+    }
+
+    /// Targets and data folder from a database's page config; calls back on the main queue.
+    private func resolve(_ db: Database, completion: @escaping (Resolved) -> Void) {
+        if let r = resolved[db.id] { completion(r); return }
+        let key = Self.key(db)
+        Self.configURL(for: db, cache: "squig-\(key)-index.html") { configURL in
+            let finish: (Data?) -> Void = { config in
+                let text = config.flatMap { String(data: $0, encoding: .utf8) } ?? ""
+                let r = Self.parseConfig(text)
+                DispatchQueue.main.async { [weak self] in
+                    self?.resolved[db.id] = r
+                    completion(r)
+                }
+            }
+            guard let configURL else { finish(nil); return }
+            Self.fetch(configURL, cache: "squig-\(key)-config.js") { finish(try? $0.get()) }
+        }
     }
 
     private static func parseBook(_ data: Data) -> [Entry] {
@@ -151,8 +257,14 @@ final class SquigCatalog: ObservableObject {
                 guard let model = phone["name"] as? String else { continue }
                 let files = (phone["file"] as? [String]) ?? (phone["file"] as? String).map { [$0] } ?? []
                 let suffixes = (phone["suffix"] as? [String]) ?? (phone["suffix"] as? String).map { [$0] } ?? []
+                let stem = (phone["prefix"] as? String) ?? "\(brandName) \(model)"
                 for (i, file) in files.enumerated() {
-                    let suffix = files.count > 1 ? (i < suffixes.count ? suffixes[i] : "") : ""
+                    var suffix = files.count > 1 && i < suffixes.count ? suffixes[i] : ""
+                    // Unlabelled variants (pads, positions, units) differ only in the file
+                    // name; without this they list as identical rows.
+                    if files.count > 1, suffix.isEmpty {
+                        suffix = file.hasPrefix(stem) ? String(file.dropFirst(stem.count)).trimmingCharacters(in: .whitespaces) : file
+                    }
                     out.append(Entry(brand: brandName, model: model, file: file, suffix: suffix))
                 }
             }
@@ -166,37 +278,62 @@ final class SquigCatalog: ObservableObject {
             guard let data = try? result.get(), let html = String(data: data, encoding: .utf8) else {
                 completion(db.folder.appendingPathComponent("config.js")); return
             }
-            let pattern = #"src="([^"]*config[^"]*\.js)""#
-            if let m = html.range(of: pattern, options: .regularExpression) {
-                let tag = html[m]
-                let src = tag.dropFirst(5).dropLast()
-                completion(URL(string: String(src), relativeTo: db.folder)?.absoluteURL)
+            // `config.js`, `config_hp.js`, `./config.js?cachebust`: the query is dropped.
+            let pattern = #"src="([^"?]*config[^"?]*\.js)(\?[^"]*)?""#
+            if let regex = try? NSRegularExpression(pattern: pattern),
+               let m = regex.firstMatch(in: html, range: NSRange(html.startIndex..., in: html)),
+               let src = Range(m.range(at: 1), in: html) {
+                // Standardized: Foundation keeps a leading `../` at the site root, which 404s.
+                completion(URL(string: String(html[src]), relativeTo: db.folder)?.absoluteURL.standardized)
             } else {
                 completion(db.folder.appendingPathComponent("config.js"))
             }
         }
     }
 
-    /// `const targets = [ { type:"Reference", files:["Harman 2019 IEM", ...] }, ... ]`; Δ groups are
-    /// differences for display, not targets.
-    private static func parseTargets(_ config: String) -> [Target] {
-        guard let start = config.range(of: "targets = [") else { return [] }
-        var depth = 0; var end = start.upperBound
-        for i in config[start.lowerBound...].indices {
+    /// Two page formats. CrinGraph: `DIR = "data/"`, `const targets = [ {type, files} ]`,
+    /// targets in `DIR/targets/` (older sites: `DIR`). The newer graph tool: a `CONFIG`
+    /// object with `PATH.PHONE_MEASUREMENT`, `PATH.TARGET_MEASUREMENT` and `TARGET_MANIFEST`.
+    private static func parseConfig(_ config: String) -> Resolved {
+        if config.contains("TARGET_MANIFEST") {
+            func path(_ key: String, _ fallback: String) -> String {
+                guard let m = config.range(of: key + #"\s*:\s*"[^"]*""#, options: .regularExpression) else { return fallback }
+                var v = String(config[m].drop { $0 != "\"" }.dropFirst().dropLast())
+                if v.hasPrefix("./") { v.removeFirst(2) }
+                return v.isEmpty ? fallback : (v.hasSuffix("/") ? v : v + "/")
+            }
+            return Resolved(targets: parseTargets(config, after: "TARGET_MANIFEST"),
+                            phoneDir: path("PHONE_MEASUREMENT", "data/phones/"),
+                            targetDirs: [path("TARGET_MEASUREMENT", "data/target/")],
+                            channels: ["L", "R"], samples: [""])
+        }
+        let dir = parseDataDir(config)
+        return Resolved(targets: parseTargets(config, after: "targets = ["), phoneDir: dir,
+                        targetDirs: [dir + "targets/", dir],
+                        channels: parseChannels(config), samples: parseSamples(config))
+    }
+
+    /// Target groups `{ type: "Reference", files: ["Harman 2019 IEM", ...] }` in the first
+    /// bracketed list after `marker`; `type` is optional. Δ groups and ∆/Δ files are
+    /// compensation deltas for display, not curves to aim for.
+    private static func parseTargets(_ config: String, after marker: String) -> [Target] {
+        guard let marked = config.range(of: marker), let open = config[marked.lowerBound...].firstIndex(of: "[") else { return [] }
+        var depth = 0; var end = config.endIndex
+        for i in config[open...].indices {
             let c = config[i]
             if c == "[" { depth += 1 } else if c == "]" { depth -= 1; if depth == 0 { end = i; break } }
         }
-        let body = String(config[start.upperBound..<end])
+        let body = String(config[config.index(after: open)..<end])
         var out: [Target] = []
-        let groupPattern = #"type\s*:\s*"([^"]*)"\s*,\s*files\s*:\s*\[([^\]]*)\]"#
+        let groupPattern = #"(?:type\s*:\s*"([^"]*)"\s*,\s*)?files\s*:\s*\[([^\]]*)\]"#
         guard let regex = try? NSRegularExpression(pattern: groupPattern) else { return [] }
         for m in regex.matches(in: body, range: NSRange(body.startIndex..., in: body)) {
-            guard let g = Range(m.range(at: 1), in: body), let f = Range(m.range(at: 2), in: body) else { continue }
-            let group = String(body[g])
+            guard let f = Range(m.range(at: 2), in: body) else { continue }
+            let group = Range(m.range(at: 1), in: body).map { String(body[$0]) } ?? ""
             if group.hasPrefix("Δ") { continue }
             for raw in body[f].split(separator: ",") {
                 let name = raw.trimmingCharacters(in: .whitespacesAndNewlines).trimmingCharacters(in: CharacterSet(charactersIn: "'\""))
-                if !name.isEmpty { out.append(Target(name: name, group: group)) }
+                if !name.isEmpty, !name.hasPrefix("∆"), !name.hasPrefix("Δ") { out.append(Target(name: name, group: group)) }
             }
         }
         return out
@@ -210,62 +347,141 @@ final class SquigCatalog: ObservableObject {
         return dir.isEmpty ? "data/" : dir
     }
 
-    private static func defaultTarget(_ targets: [Target]) -> Target? {
-        targets.first { $0.name.localizedCaseInsensitiveContains("harman") }
-            ?? targets.first { $0.group.localizedCaseInsensitiveContains("reference") }
-            ?? targets.first
+    /// `default_channels = ["L","R"]`; some databases publish one channel only.
+    private static func parseChannels(_ config: String) -> [String] {
+        guard let m = config.range(of: #"default_channels\s*=\s*\[([^\]]*)\]"#, options: .regularExpression) else { return ["L", "R"] }
+        let inner = config[m].drop { $0 != "[" }.dropFirst().dropLast()
+        let channels = inner.split(separator: ",").map { $0.trimmingCharacters(in: .whitespacesAndNewlines).trimmingCharacters(in: CharacterSet(charactersIn: "'\"")) }.filter { !$0.isEmpty }
+        return channels.isEmpty ? ["L", "R"] : channels
     }
 
-    func search(_ query: String, limit: Int = 40) -> [Entry] {
+    /// `num_samples = 3` numbers the files `L1`…`L3`; without it there is one unnumbered file.
+    private static func parseSamples(_ config: String) -> [String] {
+        guard let m = config.range(of: #"num_samples\s*=\s*\d+"#, options: .regularExpression),
+              let n = Int(config[m].filter(\.isNumber)), n > 0 else { return [""] }
+        return (1...min(n, 5)).map(String.init)
+    }
+
+    /// Targets usable for this database, best first for the style. Loudspeaker/room
+    /// curves are dropped, and so is a "target" that is really another phone's
+    /// measurement (a reviewer's reference unit): correcting towards it is not a target.
+    static func ranked(_ targets: [Target], for db: Database, style: Style, phones: Set<String>) -> [Target] {
+        let inEar = !db.type.localizedCaseInsensitiveContains("headphone")
+        func has(_ t: Target, _ words: [String]) -> Bool { words.contains { t.name.range(of: $0, options: .caseInsensitive) != nil } }
+        func score(_ t: Target) -> Int {
+            let harman = has(t, ["harman"])
+            // "IE"/"OE" as words, years Harman used for each, and the plain descriptions.
+            let fitsIE = has(t, [" IE ", " IE", "in-ear", "IEM", "2017", "2019"])
+            let fitsOE = has(t, [" OE ", " OE", "over-ear", "2013", "2015", "2018"])
+            let fits = inEar ? !fitsOE : !fitsIE
+            let neutral = has(t, ["DF", "diffuse", "neutral", "ISO", "JM-1", "KEMAR", "free field"])
+                || t.group.localizedCaseInsensitiveContains("neutral") || t.group.localizedCaseInsensitiveContains("hrtf")
+            switch style {
+            case .harman: return harman ? (fits ? 0 : 1) : neutral ? 2 : 3
+            case .neutral: return neutral ? 0 : harman ? (fits ? 1 : 2) : 3
+            }
+        }
+        return targets
+            .filter { !has($0, ["in-room", "loudspeaker", "speaker"]) && !phones.contains($0.name.lowercased()) }
+            .enumerated().sorted { (score($0.element), $0.offset) < (score($1.element), $1.offset) }.map(\.element)
+    }
+
+    /// The selected database, or every indexed one when `everywhere`.
+    func search(_ query: String, everywhere: Bool, limit: Int = 40) -> [Hit] {
         let terms = query.lowercased().split(separator: " ").map(String.init)
         guard !terms.isEmpty else { return [] }
-        return entries.filter { e in
-            let hay = e.title.lowercased()
-            return terms.allSatisfy { hay.contains($0) }
+        let pool: [(Database, [Entry])]
+        if everywhere {
+            pool = databases.compactMap { db in books[db.id].map { (db, $0) } }
+        } else {
+            pool = database.map { [($0, entries)] } ?? []
         }
-        .sorted { $0.title.count < $1.title.count }
-        .prefix(limit).map { $0 }
+        var hits: [Hit] = []
+        for (db, book) in pool {
+            for e in book where terms.allSatisfy({ e.title.lowercased().contains($0) }) {
+                hits.append(Hit(db: db, entry: e))
+            }
+        }
+        return hits
+            .sorted { ($0.entry.title.count, $0.db.siteName.lowercased()) < ($1.entry.title.count, $1.db.siteName.lowercased()) }
+            .prefix(limit).map { $0 }
     }
 
     // MARK: Measurements
 
-    /// The correction (target − measurement, centred and smoothed) for a phone, ready to fit.
-    func fetchCorrection(_ entry: Entry, completion: @escaping (Result<[(frequency: Double, gainDB: Double)], Error>) -> Void) {
-        guard let db = database else { completion(.failure(URLError(.badURL))); return }
-        guard let target else { completion(.failure(SquigError.noTarget)); return }
-        let dir = dataDir
-        func dataURL(_ name: String) -> URL? {
-            URL(string: dir + (name.addingPercentEncoding(withAllowedCharacters: .urlPathAllowed) ?? name), relativeTo: db.folder)?.absoluteURL
+    /// The correction (target − measurement, centred and smoothed) for a phone, ready to fit,
+    /// and the name of the target used. `style` nil means the database's own chosen target.
+    func fetchCorrection(_ hit: Hit, style: Style?, completion: @escaping (Result<(curve: [(frequency: Double, gainDB: Double)], target: String), Error>) -> Void) {
+        resolve(hit.db) { [weak self] r in
+            guard let self else { return }
+            // A config can list targets its server does not have: try the next best rather
+            // than fail, and when the database has none worth using, AutoEq's curve.
+            let targets = self.candidates(for: hit.db, among: r.targets, style: style)
+            Self.correction(for: hit, targets: Array(targets.prefix(6)), fallback: Self.standardTarget(for: hit.db, style: style ?? .harman),
+                            resolved: r, completion: completion)
         }
-        let channels = ["\(entry.file) L.txt", "\(entry.file) R.txt", "\(entry.file).txt"].compactMap(dataURL)
-        let targetURL = dataURL("\(target.name) Target.txt")
+    }
+
+    /// AutoEq's published curve of the style for this kind of phone. Harman's research
+    /// curves are for 711/GRAS rigs, so a 5128 database gets none.
+    private static func standardTarget(for db: Database, style: Style) -> (name: String, url: URL)? {
+        let rig5128 = db.type.contains("5128")
+        let inEar = !db.type.localizedCaseInsensitiveContains("headphone")
+        let file: String?
+        switch style {
+        case .harman: file = rig5128 ? nil : inEar ? "Harman in-ear 2019" : "Harman over-ear 2018"
+        case .neutral: file = rig5128 ? "Diffuse field 5128" : "Diffuse field GRAS KEMAR"
+        }
+        guard let file, let url = URL(string: "https://raw.githubusercontent.com/jaakkopasanen/AutoEq/master/targets/" + (file.addingPercentEncoding(withAllowedCharacters: .urlPathAllowed) ?? file) + ".csv") else { return nil }
+        return (file + " (AutoEq)", url)
+    }
+
+    private static func correction(for hit: Hit, targets: [Target], fallback: (name: String, url: URL)?, resolved r: Resolved, completion: @escaping (Result<(curve: [(frequency: Double, gainDB: Double)], target: String), Error>) -> Void) {
+        let db = hit.db, entry = hit.entry
+        func url(_ dir: String, _ name: String) -> URL? {
+            URL(string: dir + (name.addingPercentEncoding(withAllowedCharacters: .urlPathAllowed) ?? name), relativeTo: db.folder)?.absoluteURL.standardized
+        }
+        let files = r.channels.flatMap { c in r.samples.map { "\(entry.file) \(c)\($0).txt" } }
+        let channels = (files + ["\(entry.file).txt"]).compactMap { url(r.phoneDir, $0) }
         let group = DispatchGroup()
         var curves: [[(Double, Double)]] = []
         var targetCurve: [(Double, Double)]?
+        var targetName = ""
         let lock = NSLock()
-        for url in channels.prefix(2) {
+        for url in channels.dropLast() {
             group.enter()
-            Self.fetch(url, cache: nil) { result in
-                if let data = try? result.get(), let curve = Self.parseResponse(data), curve.count > 20 {
+            fetch(url, cache: nil) { result in
+                if let data = try? result.get(), let curve = parseResponse(data), curve.count > 20 {
                     lock.lock(); curves.append(curve); lock.unlock()
                 }
                 group.leave()
             }
         }
-        if let targetURL {
-            group.enter()
-            Self.fetch(targetURL, cache: "squig-\(key)-target-\(target.name.filter { $0.isLetter || $0.isNumber }).txt") { result in
-                if let data = try? result.get() { targetCurve = Self.parseResponse(data) }
-                group.leave()
+        var attempts: [(name: String, url: URL, cache: String)] = targets.flatMap { t in
+            r.targetDirs.compactMap { url($0, "\(t.name) Target.txt") }.map { (t.name, $0, "squig-\(key(db))-target-\(t.name.filter { $0.isLetter || $0.isNumber }).txt") }
+        }
+        if let fallback { attempts.append((fallback.name, fallback.url, "autoeq-target-\(fallback.name.filter { $0.isLetter || $0.isNumber }).csv")) }
+        group.enter()
+        func tryTarget(_ i: Int) {
+            guard i < attempts.count else { group.leave(); return }
+            let a = attempts[i]
+            fetch(a.url, cache: a.cache) { result in
+                if let data = try? result.get(), let curve = parseResponse(data), curve.count > 20 {
+                    targetCurve = curve; targetName = a.name
+                    group.leave()
+                } else {
+                    tryTarget(i + 1)
+                }
             }
         }
+        tryTarget(0)
         group.notify(queue: .global(qos: .userInitiated)) {
             var measured = curves
-            if measured.isEmpty, let single = channels.dropFirst(2).first {
+            if measured.isEmpty, let single = channels.last {
                 // Single-file phones: no channel suffix.
                 let sem = DispatchSemaphore(value: 0)
-                Self.fetch(single, cache: nil) { result in
-                    if let data = try? result.get(), let curve = Self.parseResponse(data) { measured = [curve] }
+                fetch(single, cache: nil) { result in
+                    if let data = try? result.get(), let curve = parseResponse(data) { measured = [curve] }
                     sem.signal()
                 }
                 sem.wait()
@@ -273,7 +489,7 @@ final class SquigCatalog: ObservableObject {
             guard !measured.isEmpty else { DispatchQueue.main.async { completion(.failure(SquigError.noMeasurement)) }; return }
             guard let targetCurve, targetCurve.count > 20 else { DispatchQueue.main.async { completion(.failure(SquigError.noTarget)) }; return }
             let correction = Correction.compute(measurement: Correction.average(measured), target: targetCurve)
-            DispatchQueue.main.async { completion(.success(correction)) }
+            DispatchQueue.main.async { completion(.success((curve: correction, target: targetName))) }
         }
     }
 
@@ -311,8 +527,8 @@ final class SquigCatalog: ObservableObject {
     }
 
     /// GET with an on-disk cache; squig.link refuses requests without a browser-like agent.
-    private static func fetch(_ url: URL, cache: String?, completion: @escaping (Result<Data, Error>) -> Void) {
-        if let cache {
+    private static func fetch(_ url: URL, cache: String?, refresh: Bool = false, completion: @escaping (Result<Data, Error>) -> Void) {
+        if let cache, !refresh {
             let file = cacheDir.appendingPathComponent(cache)
             if let attrs = try? FileManager.default.attributesOfItem(atPath: file.path),
                let modified = attrs[.modificationDate] as? Date, Date().timeIntervalSince(modified) < cacheAge,

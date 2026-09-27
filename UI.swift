@@ -1966,7 +1966,7 @@ struct ParametricEditor: View {
             HStack(spacing: 8) {
                 HStack(spacing: 6) {
                     Image(systemName: audio.importing ? "arrow.down.circle" : "magnifyingglass").font(.system(size: 10)).foregroundStyle(.tertiary)
-                    TextField(audio.profileSource == .autoEQ ? "AutoEq headphone…" : "\(audio.squig.database?.siteName ?? "squig.link") phone…", text: $query)
+                    TextField(searchPrompt, text: $query)
                         .textFieldStyle(.plain).font(.system(size: 12))
                         .onChange(of: query) { _, q in if !q.isEmpty { loadCatalog() } }
                 }
@@ -1978,13 +1978,8 @@ struct ParametricEditor: View {
             }
             ProfileChips(audio: audio)
             if !query.isEmpty {
-                Group {
-                    switch audio.profileSource {
-                    case .autoEQ: AutoEQResults(audio: audio, query: query) { query = "" }
-                    case .squig: SquigResults(audio: audio, query: query) { query = "" }
-                    }
-                }
-                .transition(T.rise)
+                ProfileResults(audio: audio, query: query) { query = "" }
+                    .transition(T.rise)
             }
 
             BandColumns(bands: bands, selected: current?.id, height: m.faderH,
@@ -2018,8 +2013,17 @@ struct ParametricEditor: View {
         .animation(T.quick, value: query.isEmpty)
     }
 
+    private var searchPrompt: String {
+        switch audio.profileSource {
+        case .all: "Search headphones and IEMs…"
+        case .autoEQ: "AutoEq headphone…"
+        case .squig: "\(audio.squig.database?.siteName ?? "squig.link") phone…"
+        }
+    }
+
     private func loadCatalog() {
         switch audio.profileSource {
+        case .all: audio.autoEQ.load(); audio.squig.loadAll()
         case .autoEQ: audio.autoEQ.load()
         case .squig: audio.squig.load()
         }
@@ -2157,52 +2161,139 @@ struct BandDetail: View {
     }
 }
 
-struct AutoEQResults: View {
+/// Search results for the current source. In *All sources* AutoEq's curated results
+/// come first, then every squig.link database that lists the phone, each labelled.
+struct ProfileResults: View {
     @Environment(\.metrics) private var m
     @ObservedObject var audio: AudioState
     let query: String
     let done: () -> Void
-    @ObservedObject private var catalog: AutoEQCatalog
+    @ObservedObject private var autoEQ: AutoEQCatalog
+    @ObservedObject private var squig: SquigCatalog
 
     init(audio: AudioState, query: String, done: @escaping () -> Void) {
-        self.audio = audio; self.query = query; self.done = done; self.catalog = audio.autoEQ
+        self.audio = audio; self.query = query; self.done = done
+        self.autoEQ = audio.autoEQ; self.squig = audio.squig
+    }
+
+    private enum Row: Identifiable {
+        case header(String), autoEQ(AutoEQCatalog.Entry), squig(SquigCatalog.Hit)
+        var id: String {
+            switch self {
+            case .header(let t): "h|" + t
+            case .autoEQ(let e): "a|" + e.id
+            case .squig(let h): "s|" + h.id
+            }
+        }
+    }
+
+    private var rows: [Row] {
+        switch audio.profileSource {
+        case .all:
+            // Grouped by where the curve comes from. AutoEq lists many variants of one
+            // model, so it is capped to keep the reviewer measurements in view.
+            let curated = autoEQ.search(query, limit: 8).map(Row.autoEQ)
+            let measured = squig.search(query, everywhere: true, limit: 40)
+            let sites = Set(measured.map(\.db.site)).count
+            return (curated.isEmpty ? [] : [.header("AutoEq · ready-made corrections")] + curated)
+                + (measured.isEmpty ? [] : [.header("squig.link · \(measured.count) measurements from \(sites) reviewer\(sites == 1 ? "" : "s")")] + measured.map(Row.squig))
+        case .autoEQ:
+            return autoEQ.search(query).map(Row.autoEQ)
+        case .squig:
+            return squig.search(query, everywhere: false).map(Row.squig)
+        }
+    }
+
+    /// Loading or failure to report above (or instead of) the rows.
+    private var status: (text: String, warn: Bool)? {
+        switch audio.profileSource {
+        case .all:
+            if squig.indexTotal == 0 || squig.indexed < squig.indexTotal {
+                return ("Searching \(squig.indexed)/\(max(squig.indexTotal, squig.indexed)) squig.link databases…", false)
+            }
+            if case .loading = autoEQ.state { return ("Loading AutoEq…", false) }
+            return nil
+        case .autoEQ:
+            switch autoEQ.state {
+            case .loading: return ("Loading catalogue…", false)
+            case .failed(let e): return ("Catalogue unavailable: \(e)", true)
+            default: return nil
+            }
+        case .squig:
+            if squig.database == nil { return ("Pick a squig.link database first", false) }
+            switch squig.state {
+            case .loading: return ("Loading measurements…", false)
+            case .failed(let e): return ("Database unavailable: \(e)", true)
+            default: return nil
+            }
+        }
     }
 
     var body: some View {
+        let rows = rows
         VStack(alignment: .leading, spacing: 0) {
-            switch catalog.state {
-            case .loading: Text("Loading catalogue…").font(m.mono).foregroundStyle(.tertiary).padding(10)
-            case .failed(let e): Text("Catalogue unavailable: \(e)").font(m.mono).foregroundStyle(T.warn).padding(10)
-            case .idle: EmptyView()
-            case .ready:
-                let results = catalog.search(query)
-                if results.isEmpty {
-                    Text("No matches").font(m.mono).foregroundStyle(.tertiary).padding(10)
-                } else {
-                    ScrollView {
-                        VStack(spacing: 1) {
-                            ForEach(results) { e in
-                                Button { audio.applyAutoEQ(e); done() } label: {
-                                    HStack {
-                                        VStack(alignment: .leading, spacing: 2) {
-                                            Text(e.title).font(.system(size: 12)).lineLimit(1).truncationMode(.middle)
-                                            Text(e.subtitle).font(m.monoSmall).foregroundStyle(.tertiary).lineLimit(1)
-                                        }
-                                        Spacer()
+            if let status {
+                Text(status.text).font(m.monoSmall).foregroundStyle(status.warn ? T.warn : Color.secondary.opacity(0.6))
+                    .padding(.horizontal, 10).padding(.top, 8).padding(.bottom, rows.isEmpty ? 8 : 2)
+            }
+            if rows.isEmpty {
+                if status == nil { Text("No matches").font(m.mono).foregroundStyle(.tertiary).padding(10) }
+            } else {
+                ScrollView {
+                    VStack(spacing: 1) {
+                        ForEach(rows) { row in
+                            if case .header(let text) = row {
+                                Text(text).font(m.monoSmall).foregroundStyle(.secondary)
+                                    .frame(maxWidth: .infinity, alignment: .leading)
+                                    .padding(.horizontal, 9).padding(.top, 8).padding(.bottom, 2)
+                            } else {
+                            Button { apply(row); done() } label: {
+                                HStack {
+                                    VStack(alignment: .leading, spacing: 2) {
+                                        Text(title(row)).font(.system(size: 12)).lineLimit(1).truncationMode(.middle)
+                                        Text(source(row)).font(m.monoSmall).foregroundStyle(.tertiary).lineLimit(1)
                                     }
-                                    .padding(.horizontal, 9).padding(.vertical, 5).contentShape(Rectangle())
+                                    Spacer()
                                 }
-                                .buttonStyle(Press()).hoverRow(6)
+                                .padding(.horizontal, 9).padding(.vertical, 5).contentShape(Rectangle())
+                            }
+                            .buttonStyle(Press()).hoverRow(6)
                             }
                         }
-                        .padding(4)
                     }
-                    .frame(maxHeight: 180)
+                    .padding(4)
                 }
+                .frame(maxHeight: 220)
             }
         }
         .background(RoundedRectangle(cornerRadius: 8).fill(T.card))
         .overlay(RoundedRectangle(cornerRadius: 8).strokeBorder(T.hairline, lineWidth: 0.5))
+    }
+
+    private var all: Bool { audio.profileSource == .all }
+
+    private func apply(_ row: Row) {
+        switch row {
+        case .autoEQ(let e): audio.applyAutoEQ(e)
+        case .squig(let h): audio.applySquig(h)
+        case .header: break
+        }
+    }
+
+    private func title(_ row: Row) -> String {
+        switch row {
+        case .autoEQ(let e): e.title
+        case .squig(let h): h.entry.title
+        case .header(let t): t
+        }
+    }
+
+    private func source(_ row: Row) -> String {
+        switch row {
+        case .autoEQ(let e): all ? e.subtitle : "AutoEq · " + e.subtitle
+        case .squig(let h): h.db.title
+        case .header: ""
+        }
     }
 }
 
@@ -2266,6 +2357,10 @@ struct ProfileChips: View {
         Flow(spacing: 6) {
             Chip {
                 Menu {
+                    Button { audio.profileSource = .all } label: {
+                        HStack { Text("All sources"); if audio.profileSource == .all { Image(systemName: "checkmark") } }
+                    }
+                    Divider()
                     Button { audio.profileSource = .autoEQ } label: {
                         HStack { Text("AutoEq"); if audio.profileSource == .autoEQ { Image(systemName: "checkmark") } }
                     }
@@ -2288,7 +2383,7 @@ struct ProfileChips: View {
                     if audio.profileSource == .squig { squig.load() }
                 }
             }
-            .help("Where profiles come from: AutoEq's index or a reviewer's measurements on squig.link")
+            .help("Where profiles come from: everywhere at once, AutoEq's index, or one reviewer's measurements on squig.link")
             Chip {
                 Menu {
                     ForEach(AudioState.importBandChoices, id: \.self) { n in
@@ -2298,6 +2393,17 @@ struct ProfileChips: View {
                 .menuStyle(.borderlessButton).menuIndicator(.visible)
             }
             .help("Filters to fit. AutoEq's own result is used at 10; other counts are fitted from the full-resolution correction.")
+            if audio.profileSource == .all {
+                Chip {
+                    Menu {
+                        ForEach(SquigCatalog.Style.allCases) { style in
+                            Button { audio.targetStyle = style } label: { HStack { Text(style.title); if style == audio.targetStyle { Image(systemName: "checkmark") } } }
+                        }
+                    } label: { Text("Target: \(audio.targetStyle.title)").font(.system(size: 11)).lineLimit(1) }
+                    .menuStyle(.borderlessButton).menuIndicator(.visible)
+                }
+                .help("What squig.link measurements are corrected towards: each reviewer's Harman curve for that kind of phone, or their neutral (diffuse-field) curve. AutoEq results are its own Harman corrections.")
+            }
             if audio.profileSource == .squig, !squig.targets.isEmpty {
                 Chip {
                     Menu {
@@ -2315,62 +2421,10 @@ struct ProfileChips: View {
 
     private var sourceTitle: String {
         switch audio.profileSource {
+        case .all: "All sources"
         case .autoEQ: "AutoEq"
         case .squig: squig.database?.title ?? "squig.link"
         }
-    }
-}
-
-struct SquigResults: View {
-    @Environment(\.metrics) private var m
-    @ObservedObject var audio: AudioState
-    let query: String
-    let done: () -> Void
-    @ObservedObject private var catalog: SquigCatalog
-
-    init(audio: AudioState, query: String, done: @escaping () -> Void) {
-        self.audio = audio; self.query = query; self.done = done; self.catalog = audio.squig
-    }
-
-    var body: some View {
-        VStack(alignment: .leading, spacing: 0) {
-            if catalog.database == nil {
-                Text("Pick a squig.link database first").font(m.mono).foregroundStyle(.tertiary).padding(10)
-            } else {
-                switch catalog.state {
-                case .loading: Text("Loading measurements…").font(m.mono).foregroundStyle(.tertiary).padding(10)
-                case .failed(let e): Text("Database unavailable: \(e)").font(m.mono).foregroundStyle(T.warn).padding(10)
-                case .idle: EmptyView()
-                case .ready:
-                    let results = catalog.search(query)
-                    if results.isEmpty {
-                        Text("No matches").font(m.mono).foregroundStyle(.tertiary).padding(10)
-                    } else {
-                        ScrollView {
-                            VStack(spacing: 1) {
-                                ForEach(results) { e in
-                                    Button { audio.applySquig(e); done() } label: {
-                                        HStack {
-                                            VStack(alignment: .leading, spacing: 2) {
-                                                Text(e.title).font(.system(size: 12)).lineLimit(1).truncationMode(.middle)
-                                                Text(catalog.database?.title ?? "").font(m.monoSmall).foregroundStyle(.tertiary)
-                                            }
-                                            Spacer()
-                                        }
-                                        .padding(.horizontal, 9).padding(.vertical, 5).contentShape(Rectangle())
-                                    }
-                                    .buttonStyle(Press()).hoverRow(6)
-                                }
-                            }
-                            .padding(4)
-                        }
-                        .frame(maxHeight: 180)
-                    }
-                }
-            }
-        }
-        .background(RoundedRectangle(cornerRadius: 8).fill(T.card))
-        .overlay(RoundedRectangle(cornerRadius: 8).strokeBorder(T.hairline, lineWidth: 0.5))
     }
 }
 

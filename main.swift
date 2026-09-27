@@ -334,10 +334,22 @@ final class AudioState: ObservableObject {
 
     let autoEQ = AutoEQCatalog()
     let squig = SquigCatalog()
-    /// Where the rack page's search looks: AutoEq's index or a squig.link database.
-    enum ProfileSource: Equatable { case autoEQ, squig }
-    @Published var profileSource: ProfileSource = UserDefaults.standard.bool(forKey: "profileSourceSquig") ? .squig : .autoEQ {
-        didSet { UserDefaults.standard.set(profileSource == .squig, forKey: "profileSourceSquig") }
+    /// Where the rack page's search looks: everywhere, AutoEq's index, or the selected
+    /// squig.link database.
+    enum ProfileSource: String { case all, autoEQ, squig }
+    @Published var profileSource: ProfileSource = {
+        if let raw = UserDefaults.standard.string(forKey: "profileSource"), let s = ProfileSource(rawValue: raw) { return s }
+        // Before "all" existed the choice was a bool; a squig user keeps their database.
+        return UserDefaults.standard.bool(forKey: "profileSourceSquig") ? .squig : .all
+    }() {
+        didSet {
+            UserDefaults.standard.set(profileSource.rawValue, forKey: "profileSource")
+            UserDefaults.standard.removeObject(forKey: "profileSourceSquig")
+        }
+    }
+    /// The kind of target used for squig.link measurements when searching every source.
+    @Published var targetStyle: SquigCatalog.Style = SquigCatalog.Style(rawValue: UserDefaults.standard.string(forKey: "targetStyle") ?? "") ?? .harman {
+        didSet { UserDefaults.standard.set(targetStyle.rawValue, forKey: "targetStyle") }
     }
     /// Filters to fit when importing a correction. AutoEq's own ten-filter result is used
     /// verbatim at 10; anything else is fitted here from the full-resolution curve.
@@ -1079,7 +1091,14 @@ final class AudioState: ObservableObject {
     /// came from) so switching headphones never stacks corrections.
     private func applyProfile(_ preset: ParametricPreset, name: String) {
         let existing = rack.modules.first { $0.name?.hasPrefix("AutoEq") == true || $0.name?.hasPrefix("squig") == true }
-        applyParametric(preset, name: name, replacing: existing?.id)
+        // Searching from a freshly added EQ fills that EQ instead of stacking a second one.
+        func untouched(_ m: RackModule) -> Bool {
+            let shape = { (b: EQBand) in [b.type.rawValue, "\(b.frequency)", "\(b.gainDB)", "\(b.q)", "\(b.enabled)"] }
+            return m.kind == .parametricEQ && m.name == nil && m.param("preamp") == 0
+                && m.bands.map(shape) == ModuleKind.parametricEQ.defaultBands.map(shape)
+        }
+        let blank = rack.modules.first { $0.id == selectedModule && untouched($0) }
+        applyParametric(preset, name: name, replacing: existing?.id ?? blank?.id)
     }
 
     private func fitAndApply(_ result: Result<[(frequency: Double, gainDB: Double)], Error>, name: String, bands: Int) {
@@ -1118,11 +1137,17 @@ final class AudioState: ObservableObject {
         }
     }
 
-    func applySquig(_ entry: SquigCatalog.Entry) {
+    /// Measurement → the database's target → fitted filters, with no choices to make.
+    func applySquig(_ hit: SquigCatalog.Hit) {
         importing = true
         let bands = importBands
-        let name = "squig · \(squig.database?.siteName ?? "") · \(entry.title)"
-        squig.fetchCorrection(entry) { [weak self] result in self?.fitAndApply(result, name: name, bands: bands) }
+        // Narrowed to one database its own target choice applies; searching everywhere, the style.
+        squig.fetchCorrection(hit, style: profileSource == .all ? targetStyle : nil) { [weak self] result in
+            // The headphone stays last: the chain shows the final segment as the title.
+            let target = (try? result.get()).map { " · \($0.target)" } ?? ""
+            let name = "squig · \(hit.db.siteName)\(target) · \(hit.entry.title)"
+            self?.fitAndApply(result.map(\.curve), name: name, bands: bands)
+        }
     }
 
     // MARK: Rack history

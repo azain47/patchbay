@@ -7,10 +7,10 @@ A native, open-source DSP rack and per-app router for macOS system audio. No vir
   <img src="rack.png" width="566" alt="patchbay rack page with AutoEq profile">
 </p>
 
-[Download v1.2.0](https://github.com/azain47/patchbay/releases/tag/v1.2.0) ·
-[Watch the 30-second UI demo](https://github.com/azain47/patchbay/releases/download/v1.2.0/patchbay-linkedin.mp4)
+[Download v1.3.0](https://github.com/azain47/patchbay/releases/tag/v1.3.0) ·
+[Watch the 45-second demo](https://github.com/azain47/patchbay/releases/download/v1.3.0/patchbay-linkedin.mp4)
 
-The demo is silent and shows editing with audio processing disabled.
+The demo is silent.
 
 ## What it does
 
@@ -25,13 +25,25 @@ The demo is silent and shows editing with audio processing disabled.
   saturation → stereo/time effects → loudness → maximizer → limiter. Existing
   modules are never moved; drag if you want something else. A new EQ filter is
   inserted at the top of the list.
-- **Headphone correction** from two sources, applied as a parametric module in
-  one click: 8,800+ profiles from [jaakkopasanen/AutoEq](https://github.com/jaakkopasanen/AutoEq)
-  (oratory1990, crinacle, Rtings, …), or any reviewer database on
-  [squig.link](https://squig.link) — pick the database and target curve, and
-  the correction is computed from the measurement on the spot. Hangout.Audio
-  (crinacle's own site) opted out of third-party access and is not offered;
-  his measurements reach the app through AutoEq.
+- **Headphone correction** in one search, applied as a parametric module in one
+  click. *All sources* (the default) searches
+  [jaakkopasanen/AutoEq](https://github.com/jaakkopasanen/AutoEq)'s 8,800+
+  ready-made corrections (oratory1990, crinacle, Rtings, …) and every reviewer
+  database listed on [squig.link](https://squig.link) (130+) at once; results
+  are grouped by source and labelled with the reviewer and rig. Picking a
+  squig.link measurement does the manual steps for you: patchbay loads the
+  measurement, picks a target, computes the correction and fits the filters.
+  The **Target** chip chooses the kind of curve: *Harman* (the reviewer's Harman
+  curve for that kind of phone, in-ear or over-ear) or *Neutral* (their
+  diffuse-field curve). Loudspeaker/room curves and "targets" that are really
+  another phone's measurement are skipped. If the site lacks the file or has no
+  suitable curve, AutoEq's published Harman or diffuse-field curve is used
+  instead (5128 rigs only fall back to diffuse field, since Harman's curves were
+  defined on other rigs). The module name records the database and target used.
+  Narrow the source to one squig.link database to choose any of its targets
+  yourself. Hangout.Audio (crinacle's own site) and other databases that opted
+  out of third-party access are not offered; crinacle's measurements reach the
+  app through AutoEq.
 - **Any filter count**: AutoEq publishes ten filters per profile; ask for 5 to
   32 and patchbay fits its own from the full-resolution correction (on the HD
   650 the 10-filter fit lands within 0.25 dB RMS of the target, better than
