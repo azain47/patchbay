@@ -280,7 +280,11 @@ final class AudioState: ObservableObject {
     @Published var rack = RackSettings.neutral
     @Published var rackOn = false
     @Published var rackStatus: SystemAudioEngine.Status = .stopped
+    @Published var canUndoRack = false
+    @Published var canRedoRack = false
     @Published var selectedModule: UUID?
+
+    // Module selection travels with rack history; changing selection alone is not an edit.
 
     // Routing: which app goes where. `rack` always holds the chain being edited; `rackScope`
     // says whether that is the system chain, one route's chain, or the microphone chain.
@@ -371,6 +375,28 @@ final class AudioState: ObservableObject {
     private let engine = SystemAudioEngine()
     private var routeEngines: [UUID: SystemAudioEngine] = [:]
     private var rackDeviceUID: String?
+    private enum RackHistoryTarget: Hashable {
+        case system(String)
+        case route(UUID)
+        case input(String)
+    }
+    private struct RackSnapshot: Equatable {
+        var rack: RackSettings
+        var selectedModule: UUID?
+    }
+    private struct RackEditGroup {
+        let target: RackHistoryTarget
+        let before: RackSnapshot
+        var after: RackSnapshot
+    }
+    private struct RackHistory {
+        var undo: [RackSnapshot] = []
+        var redo: [RackSnapshot] = []
+    }
+    private static let rackHistoryLimit = 100
+    private var rackHistories: [RackHistoryTarget: RackHistory] = [:]
+    private var activeRackEdit: RackEditGroup?
+
     var onHealth: ((Bool) -> Void)?
 
     init() {
@@ -521,6 +547,7 @@ final class AudioState: ObservableObject {
             return
         }
         if rackDeviceUID != target.uid {
+            endRackEdit()
             rackDeviceUID = target.uid
             // An output with a bound preset loads it, unless its chain already came from it
             // (then any edits made on top are kept).
@@ -537,6 +564,7 @@ final class AudioState: ObservableObject {
                 rack = loaded
                 if selected == nil { selectedModule = rack.modules.first?.id }
             }
+            refreshRackHistoryFlags()
         }
         guard rackOn, active != .rack, engine.outputUID != target.uid else { return }
         engine.start(output: target, settings: systemRack)
@@ -645,6 +673,7 @@ final class AudioState: ObservableObject {
     /// owner first so nothing is lost.
     func setRackScope(_ scope: RackScope) {
         guard scope != rackScope else { return }
+        endRackEdit()
         persistRack()
         rackScope = scope
         switch scope {
@@ -653,7 +682,11 @@ final class AudioState: ObservableObject {
             loaded.enabled = rackOn
             rack = loaded
         case .route(let id):
-            guard let route = routes.first(where: { $0.id == id }) else { rackScope = .system; return }
+            guard let route = routes.first(where: { $0.id == id }) else {
+                rackScope = .system
+                refreshRackHistoryFlags()
+                return
+            }
             var loaded = route.rack
             loaded.enabled = route.enabled
             rack = loaded
@@ -663,6 +696,7 @@ final class AudioState: ObservableObject {
             rack = loaded
         }
         selectedModule = rack.modules.first?.id
+        refreshRackHistoryFlags()
     }
 
     /// What the header switch, status dot and footer refer to: the route being edited
@@ -854,13 +888,18 @@ final class AudioState: ObservableObject {
         let module = RackModule(kind: kind)
         // Keep signal order: after the last module that belongs at or before this stage, else first.
         let at = rack.modules.lastIndex { $0.kind.stage <= kind.stage }.map { $0 + 1 } ?? 0
-        update { $0.modules.insert(module, at: at) }
-        selectedModule = module.id
+        update {
+            $0.modules.insert(module, at: at)
+            selectedModule = module.id
+        }
     }
 
     func removeModule(_ id: UUID) {
-        update { $0.modules.removeAll { $0.id == id } }
-        if selectedModule == id { selectedModule = rack.modules.first?.id }
+        guard rack.modules.contains(where: { $0.id == id }) else { return }
+        update {
+            $0.modules.removeAll { $0.id == id }
+            if selectedModule == id { selectedModule = $0.modules.first?.id }
+        }
     }
 
     func moveModule(from source: IndexSet, to destination: Int) {
@@ -898,17 +937,33 @@ final class AudioState: ObservableObject {
     func resetRack() {
         var neutral = rackScope == .system ? RackSettings.neutral : RackSettings(modules: [])
         neutral.enabled = scopedOn
-        rack = neutral
-        selectedModule = rack.modules.first?.id
-        persistRack()
-        scopedEngine?.publish(rack)
+        update {
+            $0 = neutral
+            selectedModule = neutral.modules.first?.id
+        }
     }
 
     // MARK: Presets
 
     func applyPreset(_ preset: Preset) {
-        update { $0.modules = preset.modules; $0.preset = preset.id }
-        selectedModule = rack.modules.first?.id
+        update {
+            $0.modules = preset.modules
+            $0.preset = preset.id
+            selectedModule = $0.modules.first?.id
+        }
+    }
+
+    func clearPreset() {
+        if rackScope == .system, let device = rackTarget {
+            bindPreset(nil, to: device)
+        } else {
+            update {
+                $0.modules = []
+                $0.preset = nil
+                $0.bypass = false
+                selectedModule = nil
+            }
+        }
     }
 
     /// Snapshots the chain being edited. Saved from the system chain it is bound to the
@@ -944,13 +999,31 @@ final class AudioState: ObservableObject {
 
     func boundPreset(for uid: String) -> Preset? { presets.first { $0.devices.contains(uid) } }
 
-    /// Binds a preset to an output (nil unbinds). An output has at most one preset. Binding
-    /// the output the system chain is on loads the preset right away.
+    /// Selects the output's preset. Nil removes its binding and empties its chain.
+    /// The saved preset itself is never deleted.
     func bindPreset(_ id: UUID?, to device: Device) {
         for i in presets.indices { presets[i].devices.removeAll { $0 == device.uid } }
         if let id, let i = presets.firstIndex(where: { $0.id == id }) { presets[i].devices.append(device.uid) }
         presetStore.save(presets)
-        guard let id, let preset = presets.first(where: { $0.id == id }) else { return }
+        guard let id else {
+            if rackScope == .system, rackTarget?.uid == device.uid {
+                update {
+                    $0.modules = []
+                    $0.preset = nil
+                    $0.bypass = false
+                    selectedModule = nil
+                }
+            } else {
+                var stored = rackStore.settings(for: device.uid)
+                stored.modules = []
+                stored.preset = nil
+                stored.bypass = false
+                rackStore.save(stored, for: device.uid)
+                if rackTarget?.uid == device.uid, rackOn { engine.publish(systemRack) }
+            }
+            return
+        }
+        guard let preset = presets.first(where: { $0.id == id }) else { return }
         if rackScope == .system, rackTarget?.uid == device.uid {
             if rack.preset != id { applyPreset(preset) }
         } else if rackStore.settings(for: device.uid).preset != id {
@@ -970,12 +1043,17 @@ final class AudioState: ObservableObject {
         module.bands = preset.bands
         if let id, let index = rack.modules.firstIndex(where: { $0.id == id }) {
             module.id = id
-            update { $0.modules[index] = module }
+            update {
+                $0.modules[index] = module
+                selectedModule = module.id
+            }
         } else {
             guard rack.modules.count < Int(PB_MAX_MODULES) else { notice = "Rack is full."; return }
-            update { $0.modules.insert(module, at: 0) }
+            update {
+                $0.modules.insert(module, at: 0)
+                selectedModule = module.id
+            }
         }
-        selectedModule = module.id
     }
 
     func importParametricFile() {
@@ -1047,6 +1125,116 @@ final class AudioState: ObservableObject {
         squig.fetchCorrection(entry) { [weak self] result in self?.fitAndApply(result, name: name, bands: bands) }
     }
 
+    // MARK: Rack history
+
+    func beginRackEdit() {
+        guard let target = rackHistoryTarget else {
+            endRackEdit()
+            return
+        }
+        if let active = activeRackEdit {
+            if active.target == target { return }
+            endRackEdit()
+        }
+        let snapshot = currentRackSnapshot
+        activeRackEdit = RackEditGroup(target: target, before: snapshot, after: snapshot)
+    }
+
+    func endRackEdit() {
+        guard var group = activeRackEdit else { return }
+        activeRackEdit = nil
+        if let target = rackHistoryTarget, group.target == target { group.after = currentRackSnapshot }
+        recordRackEdit(before: group.before, after: group.after, target: group.target)
+    }
+
+    func undoRack() {
+        endRackEdit()
+        guard let target = rackHistoryTarget, var history = rackHistories[target], let snapshot = history.undo.popLast() else {
+            refreshRackHistoryFlags()
+            return
+        }
+        history.redo.append(currentRackSnapshot)
+        trimRackHistory(&history)
+        rackHistories[target] = history
+        restoreRackSnapshot(snapshot)
+    }
+
+    func redoRack() {
+        endRackEdit()
+        guard let target = rackHistoryTarget, var history = rackHistories[target], let snapshot = history.redo.popLast() else {
+            refreshRackHistoryFlags()
+            return
+        }
+        history.undo.append(currentRackSnapshot)
+        trimRackHistory(&history)
+        rackHistories[target] = history
+        restoreRackSnapshot(snapshot)
+    }
+
+    private var rackHistoryTarget: RackHistoryTarget? {
+        switch rackScope {
+        case .system:
+            guard let uid = rackDeviceUID ?? rackTarget?.uid else { return nil }
+            return .system(uid)
+        case .route(let id):
+            guard routes.contains(where: { $0.id == id }) else { return nil }
+            return .route(id)
+        case .input:
+            guard let uid = micSource?.uid else { return nil }
+            return .input(uid)
+        }
+    }
+
+    private var currentRackSnapshot: RackSnapshot {
+        var settings = rack
+        // Processing enablement belongs to the live target, not the edit history.
+        settings.enabled = false
+        return RackSnapshot(rack: settings, selectedModule: selectedModule)
+    }
+
+    private func restoreRackSnapshot(_ snapshot: RackSnapshot) {
+        let enabled = rack.enabled
+        var restored = snapshot.rack
+        restored.enabled = enabled
+        rack = restored
+        selectedModule = snapshot.selectedModule
+        persistRack()
+        scopedEngine?.publish(rack)
+        refreshRackHistoryFlags()
+    }
+
+    private func recordRackEdit(before: RackSnapshot, after: RackSnapshot, target: RackHistoryTarget) {
+        guard before != after else {
+            refreshRackHistoryFlags()
+            return
+        }
+        var history = rackHistories[target] ?? RackHistory()
+        history.undo.append(before)
+        history.redo.removeAll()
+        trimRackHistory(&history)
+        rackHistories[target] = history
+        refreshRackHistoryFlags()
+    }
+
+    private func trimRackHistory(_ history: inout RackHistory) {
+        if history.undo.count > Self.rackHistoryLimit {
+            history.undo.removeFirst(history.undo.count - Self.rackHistoryLimit)
+        }
+        if history.redo.count > Self.rackHistoryLimit {
+            history.redo.removeFirst(history.redo.count - Self.rackHistoryLimit)
+        }
+    }
+
+    private func refreshRackHistoryFlags() {
+        guard let target = rackHistoryTarget, let history = rackHistories[target] else {
+            canUndoRack = false
+            canRedoRack = false
+            return
+        }
+        canUndoRack = !history.undo.isEmpty
+        canRedoRack = !history.redo.isEmpty
+    }
+
     // MARK: Internals
 
     private func updateModule(_ id: UUID, _ mutate: (inout RackModule) -> Void) {
@@ -1055,9 +1243,21 @@ final class AudioState: ObservableObject {
     }
 
     private func update(_ mutate: (inout RackSettings) -> Void) {
+        let target = rackHistoryTarget
+        if let active = activeRackEdit, target.map({ active.target != $0 }) ?? true { endRackEdit() }
+        let before = currentRackSnapshot
         mutate(&rack)
+        let after = currentRackSnapshot
+        guard before != after else { return }
         persistRack()
         scopedEngine?.publish(rack)
+        guard let target else { return }
+        if var group = activeRackEdit, group.target == target {
+            group.after = after
+            activeRackEdit = group
+        } else {
+            recordRackEdit(before: before, after: after, target: target)
+        }
     }
 
     private func persistRack() {
@@ -1165,6 +1365,8 @@ final class Bar: NSObject, NSPopoverDelegate {
             pop.behavior = keep ? .applicationDefined : .transient
             if keep { stopWatchingOutside() } else if pop.isShown { watchOutside() }
         }
+        // SwiftUI owns in-content motion. AppKit's separate resize animation can
+        // temporarily displace or hide the header while preferredContentSize changes.
         pop.animates = false
         pop.delegate = self
         if let b = item.button {
@@ -1183,6 +1385,7 @@ final class Bar: NSObject, NSPopoverDelegate {
         // With several displays each menu bar has its own button; anchor to the one that was clicked.
         let clicked = NSApp.currentEvent?.window?.contentView
         guard let b = clicked ?? item.button else { return }
+        NSApp.activate(ignoringOtherApps: true)
         pop.show(relativeTo: b.bounds, of: b, preferredEdge: .minY)
         pop.contentViewController?.view.window?.makeKey()
         audio.setVisible(true)

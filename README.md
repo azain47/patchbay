@@ -7,6 +7,11 @@ A native, open-source DSP rack and per-app router for macOS system audio. No vir
   <img src="rack.png" width="566" alt="patchbay rack page with AutoEq profile">
 </p>
 
+[Download v1.2.0](https://github.com/azain47/patchbay/releases/tag/v1.2.0) ·
+[Watch the 30-second UI demo](https://github.com/azain47/patchbay/releases/download/v1.2.0/patchbay-linkedin.mp4)
+
+The demo is silent and shows editing with audio processing disabled.
+
 ## What it does
 
 - **Modular effects chain** on all system audio, reorderable by drag, up to 16 modules:
@@ -37,6 +42,20 @@ A native, open-source DSP rack and per-app router for macOS system audio. No vir
   or the microphone. Bind a preset to an output (the bookmark on its row in the
   output list, or *Load on …* in the preset menu) and switching to that output
   loads it. A preset saved from the system chain is bound to the current output.
+  Working-chain edits auto-save without overwriting the named preset; use
+  *Update “name”* to replace that saved preset.
+  **No preset** empties the chain and clears its preset label; on outputs it
+  also removes automatic preset loading. This works from the main preset
+  menu, *Load on …*, and the output's bookmark menu. Saved presets remain
+  available. Clearing the chain being edited is undoable; undo restores the
+  chain, not the output's automatic-loading assignment.
+- **Undo/redo**: the rack footer has Undo and Redo buttons; use **⌘Z** and
+  **⇧⌘Z** while the rack is open. Each slider drag is one step. Band edits,
+  module additions/removals/reordering, preset loads, bypass and resets are
+  reversible. Each output, microphone and app route has separate history
+  (up to 100 steps, held until the app quits). New edits clear redo. Restoring
+  a chain auto-saves it without overwriting presets or changing processing
+  on/off. Text fields use their own history instead of undoing the rack.
 - **EQ accuracy**: the response graph is computed from the same coefficients at
   the device's own sample rate, so what you see is what is rendered. Coefficient
   changes glide over 10 ms: dragging a fader, switching a band off or changing its
@@ -51,8 +70,16 @@ A native, open-source DSP rack and per-app router for macOS system audio. No vir
 
 ## Interface
 
-One menu bar popover with five icon tabs: output, input, routes, rack, fix. It
-opens and closes without animation; in-app motion is short springs.
+One menu bar popover with five icon tabs: output, input, routes, rack, fix.
+Tab icons stay fixed; only the selection pill slides. Incoming pages fade in
+at their final position, without directional movement or inherited control
+animations. The popover changes size immediately rather than running a second
+AppKit resize animation over the SwiftUI transition.
+The sidebar and graph animate their occupied width and height, keeping their
+contents mounted instead of inserting them at full size. Hidden graphs stop
+requesting spectrum updates. Chain and band selections travel between items;
+response curves morph, buttons respond on press, and sliders animate external
+value changes while following the pointer directly during a drag.
 
 - **Layout** follows the page by default (*Auto*): one width, device pages
   compact and only as tall as their content, the rack spacious and capped at

@@ -55,9 +55,9 @@ cat > "$APP/Contents/Info.plist" << 'EOF'
     <key>CFBundleExecutable</key>
     <string>patchbay</string>
     <key>CFBundleVersion</key>
-    <string>1.0</string>
+    <string>1.2.0</string>
     <key>CFBundleShortVersionString</key>
-    <string>1.0</string>
+    <string>1.2.0</string>
     <key>LSUIElement</key>
     <true/>
     <key>CFBundlePackageType</key>

@@ -111,15 +111,18 @@ enum T {
         onAccent = a == .mono ? Color(nsColor: .windowBackgroundColor) : Color.black.opacity(0.82)
     }
 
-    static let quick = Animation.spring(response: 0.22, dampingFraction: 0.86)
-    static let tab = Animation.spring(response: 0.16, dampingFraction: 0.95)
-    /// Selection movement: fast with a hint of overshoot.
-    static let snap = Animation.spring(response: 0.26, dampingFraction: 0.78)
+    // Response is the spring's period: at 0.35–0.45 s a move is visibly travelled (about
+    // 12–16 frames to settle) yet lands before the hand leaves the mouse.
+    static let quick = Animation.spring(response: 0.32, dampingFraction: 0.84)
+    /// Selection and toggles: a hint of overshoot.
+    static let snap = Animation.spring(response: 0.38, dampingFraction: 0.74)
+    /// Page swap.
+    static let page = Animation.spring(response: 0.42, dampingFraction: 0.88)
     /// Things appearing: rise a few points while fading in.
     static let rise = AnyTransition.asymmetric(
         insertion: .opacity.combined(with: .offset(y: 6)).combined(with: .scale(scale: 0.98, anchor: .top)),
         removal: .opacity)
-    static let hoverAnim = Animation.easeOut(duration: 0.07)
+    static let hoverAnim = Animation.easeOut(duration: 0.14)
 }
 
 private struct MetricsKey: EnvironmentKey { static let defaultValue = Theme.Density.compact.metrics }
@@ -243,6 +246,7 @@ struct Root: View {
                 }
             }
             .padding(.horizontal, T.chromePadding).padding(.vertical, 12)
+            .fixedSize(horizontal: false, vertical: true)
             // T.accent is a static token, not an environment value: rebuilding is what makes
             // a new accent reach views whose inputs did not otherwise change. The footer is
             // left alone so the settings popout picking the accent stays open.
@@ -250,31 +254,33 @@ struct Root: View {
 
             Rectangle().fill(T.hairline).frame(height: 0.5)
 
-            // Every page stays mounted so faders, scroll positions and selections survive
-            // a tab switch; pages behind the front one are collapsed to zero height.
-            // The swap itself is deliberately unanimated: the new page appears in its
-            // final state, nothing grows, fades or settles.
+            // Preserve page state, but resolve layout immediately. Only the page's
+            // opacity animates; child controls must not inherit a tab-switch spring.
             ZStack(alignment: .top) {
                 ForEach(Tab.allCases) { t in
                     let active = t == tab
+                    let metrics = theme.density.metrics(for: t)
                     page(t, active: active)
-                        .environment(\.metrics, theme.density.metrics(for: t))
+                        .environment(\.metrics, metrics)
+                        .animation(T.page) { content in
+                            content.opacity(active ? 1 : 0)
+                        }
                         .frame(height: active ? nil : 0, alignment: .top)
                         .clipped()
-                        .opacity(active ? 1 : 0)
                         .allowsHitTesting(active)
+                        .accessibilityHidden(!active)
                 }
             }
-            .animation(nil, value: tab)
             .id(theme.accent)
 
             Rectangle().fill(T.hairline).frame(height: 0.5)
             Footer(audio: audio, theme: theme)
         }
         .frame(width: front.width)
-        .frame(maxHeight: front.maxHeight)
+        .frame(maxHeight: front.maxHeight, alignment: .top)
         .environment(\.metrics, front)
         .onChange(of: audio.rackStatus) { _, s in if case .failed(let message) = s { audio.notice = message } }
+        .background(RackShortcutHost(audio: audio))
     }
 
     @ViewBuilder
@@ -299,12 +305,110 @@ struct Root: View {
     }
 }
 
+/// Handles rack undo at the event boundary so a focused AppKit text editor keeps Cmd-Z.
+/// View-level SwiftUI keyboard shortcuts are resolved before the native text responder.
+private struct RackShortcutHost: NSViewRepresentable {
+    let audio: AudioState
+
+    func makeNSView(context: Context) -> RackShortcutView {
+        let view = RackShortcutView()
+        view.audio = audio
+        return view
+    }
+
+    func updateNSView(_ nsView: RackShortcutView, context: Context) {
+        nsView.audio = audio
+    }
+
+    static func dismantleNSView(_ nsView: RackShortcutView, coordinator: ()) {
+        nsView.stopMonitoring()
+    }
+}
+
+private final class RackShortcutView: NSView {
+    weak var audio: AudioState?
+    private var monitor: Any?
+
+    override func viewDidMoveToWindow() {
+        super.viewDidMoveToWindow()
+        if window == nil {
+            stopMonitoring()
+        } else {
+            startMonitoring()
+        }
+    }
+
+    deinit {
+        stopMonitoring()
+    }
+
+    fileprivate func stopMonitoring() {
+        if let monitor {
+            NSEvent.removeMonitor(monitor)
+            self.monitor = nil
+        }
+    }
+
+    private func startMonitoring() {
+        guard monitor == nil else { return }
+        monitor = NSEvent.addLocalMonitorForEvents(matching: .keyDown) { [weak self] event in
+            guard let self else { return event }
+            return self.handle(event)
+        }
+    }
+
+    private func handle(_ event: NSEvent) -> NSEvent? {
+        guard let audio,
+              audio.tab == .rack,
+              let window,
+              event.window === window,
+              NSApp.keyWindow === window,
+              event.keyCode == 6
+        else { return event }
+
+        let modifiers = event.modifierFlags.intersection([.command, .shift, .option, .control])
+        if Self.isTextResponder(window.firstResponder) {
+            // This menu-bar app has no Edit menu to dispatch the standard commands.
+            // Keep text edits on the field editor's native history, never the rack's.
+            guard let manager = window.firstResponder?.undoManager else { return event }
+            if modifiers == .command, manager.canUndo {
+                manager.undo()
+                return nil
+            }
+            if modifiers == [.command, .shift], manager.canRedo {
+                manager.redo()
+                return nil
+            }
+            return event
+        }
+        switch modifiers {
+        case .command:
+            guard audio.canUndoRack else { return event }
+            audio.undoRack()
+            return nil
+        case [.command, .shift]:
+            guard audio.canRedoRack else { return event }
+            audio.redoRack()
+            return nil
+        default:
+            return event
+        }
+    }
+
+    private static func isTextResponder(_ responder: NSResponder?) -> Bool {
+        var current = responder
+        while let responder = current {
+            if responder is NSTextView || responder is NSTextField || responder is NSSearchField { return true }
+            current = responder.nextResponder
+        }
+        return false
+    }
+}
+
 struct TabBar: View {
     @Binding var tab: Tab
 
-    /// The lit pill slides between icons on its own spring. It is an offset inside this
-    /// view, animated by a modifier here, so no animation transaction reaches the pages:
-    /// their swap (and the popover's resize) stays instant.
+    /// Only the selection pill moves. Icons and hit targets stay outside its animation.
     var body: some View {
         let index = CGFloat(Tab.allCases.firstIndex(of: tab) ?? 0)
         HStack(spacing: 2) {
@@ -321,9 +425,11 @@ struct TabBar: View {
             }
         }
         .background(alignment: .leading) {
-            Capsule().fill(T.press).frame(width: 30, height: 22).offset(x: index * 32)
+            Capsule().fill(T.press).frame(width: 30, height: 22)
+                .animation(T.snap) { content in
+                    content.offset(x: index * 32)
+                }
         }
-        .animation(T.snap, value: tab)
         .padding(2)
         .background(Capsule().fill(T.card))
         .overlay(Capsule().strokeBorder(T.hairline, lineWidth: 0.5))
@@ -977,6 +1083,7 @@ struct Fader: View {
     var center: Double? = nil
     /// How the bubble prints the value; nil falls back to a plain number.
     var label: ((Double) -> String)? = nil
+    var onEditingChanged: (Bool) -> Void = { _ in }
     let set: (Double) -> Void
     @State private var dragging = false
     @State private var hover = false
@@ -1029,10 +1136,17 @@ struct Fader: View {
             .onHover { hover = $0 }
             .gesture(DragGesture(minimumDistance: 0)
                 .onChanged { v in
-                    dragging = true
+                    if !dragging {
+                        dragging = true
+                        onEditingChanged(true)
+                    }
                     set(denorm(scrub.step(pointer: v.location.x, length: w, current: norm(value))))
                 }
-                .onEnded { _ in dragging = false; scrub.end() })
+                .onEnded { _ in
+                    if dragging { onEditingChanged(false) }
+                    dragging = false
+                    scrub.end()
+                })
             .animation(T.quick, value: scrub.shift)
         }
         .frame(height: 18)
@@ -1043,6 +1157,7 @@ struct VFader: View {
     let value: Double
     let range: ClosedRange<Double>
     var label: ((Double) -> String)? = nil
+    var onEditingChanged: (Bool) -> Void = { _ in }
     let set: (Double) -> Void
     @State private var dragging = false
     @State private var hover = false
@@ -1079,12 +1194,19 @@ struct VFader: View {
             .onHover { hover = $0 }
             .gesture(DragGesture(minimumDistance: 0)
                 .onChanged { v in
-                    dragging = true
+                    if !dragging {
+                        dragging = true
+                        onEditingChanged(true)
+                    }
                     // Screen y grows downward; measure from the bottom so the axis grows with the fader.
                     let t = scrub.step(pointer: h - v.location.y, length: h, current: n)
                     set(range.lowerBound + min(1, max(0, t)) * (range.upperBound - range.lowerBound))
                 }
-                .onEnded { _ in dragging = false; scrub.end() })
+                .onEnded { _ in
+                    if dragging { onEditingChanged(false) }
+                    dragging = false
+                    scrub.end()
+                })
             .animation(T.quick, value: scrub.shift)
         }
     }
@@ -1094,6 +1216,7 @@ struct ParamRow: View {
     @Environment(\.metrics) private var m
     let spec: ParamSpec
     let value: Double
+    var onEditingChanged: (Bool) -> Void = { _ in }
     let set: (Double) -> Void
 
     var body: some View {
@@ -1105,7 +1228,8 @@ struct ParamRow: View {
                 }
                 .labelsHidden().pickerStyle(.segmented).controlSize(.small)
             } else {
-                Fader(value: value, range: spec.range, log: spec.log, center: spec.range.contains(0) && spec.range.lowerBound < 0 ? 0 : nil, label: format) { v in
+                Fader(value: value, range: spec.range, log: spec.log, center: spec.range.contains(0) && spec.range.lowerBound < 0 ? 0 : nil,
+                      label: format, onEditingChanged: onEditingChanged) { v in
                     set(spec.step > 0 ? (v / spec.step).rounded() * spec.step : v)
                 }
                 Text(format(value)).font(m.mono).foregroundStyle(.secondary).lineLimit(1).frame(width: 58, alignment: .trailing)
@@ -1130,29 +1254,36 @@ struct ParamRow: View {
 struct RackTab: View {
     @Environment(\.metrics) private var m
     @ObservedObject var audio: AudioState
-    /// False while another page is in front; the analyser stops and the graph unmounts.
+    /// False while another page is in front; the analyser stops.
     var active = true
-    @AppStorage("showGraph") private var showGraph = false
-    @AppStorage("chainOpen") private var chainOpen = true
+    // Keep panel state local; persist independently of the visual transition.
+    @State private var showGraph = UserDefaults.standard.object(forKey: "showGraph") as? Bool ?? false
+    @State private var chainOpen = UserDefaults.standard.object(forKey: "chainOpen") as? Bool ?? true
 
     var body: some View {
         let editorWidth = chainOpen ? m.width - m.chainW - 0.5 : m.width
         VStack(spacing: 0) {
             if !audio.scopeOn { OffBanner(audio: audio).transition(.move(edge: .top).combined(with: .opacity)) }
             HStack(spacing: 0) {
-                if chainOpen {
+                HStack(spacing: 0) {
                     ChainColumn(audio: audio)
                         .frame(width: m.chainW)
-                        .transition(.move(edge: .leading).combined(with: .opacity))
                     Rectangle().fill(T.hairline).frame(width: 0.5)
                 }
+                .frame(width: chainOpen ? m.chainW + 0.5 : 0, alignment: .leading)
+                .clipped()
+                .opacity(chainOpen ? 1 : 0)
+                .allowsHitTesting(chainOpen)
+                .accessibilityHidden(!chainOpen)
                 VStack(spacing: 0) {
-                    if showGraph && active {
-                        Graph(audio: audio)
-                            .frame(height: m.faderH + 40)
-                            .padding(.horizontal, m.gutter).padding(.top, m.sectionTop).padding(.bottom, 2)
-                            .transition(.asymmetric(insertion: .opacity.combined(with: .scale(scale: 0.96, anchor: .top)), removal: .opacity))
-                    }
+                    Graph(audio: audio, analyzing: showGraph && active)
+                        .frame(height: m.faderH + 40)
+                        .padding(.horizontal, m.gutter).padding(.top, m.sectionTop).padding(.bottom, 2)
+                        .frame(height: showGraph ? m.faderH + 42 + m.sectionTop : 0, alignment: .top)
+                        .clipped()
+                        .opacity(showGraph ? 1 : 0)
+                        .allowsHitTesting(showGraph)
+                        .accessibilityHidden(!showGraph)
                     ModuleEditor(audio: audio, chainOpen: chainOpen)
                         .animation(T.snap, value: audio.selectedModule)
                 }
@@ -1161,12 +1292,16 @@ struct RackTab: View {
                 .environment(\.editorWidth, editorWidth)
             }
             .clipped()
+            .animation(T.snap, value: chainOpen)
+            .animation(T.snap, value: showGraph)
+            .onChange(of: chainOpen) { _, v in UserDefaults.standard.set(v, forKey: "chainOpen") }
+            .onChange(of: showGraph) { _, v in UserDefaults.standard.set(v, forKey: "showGraph") }
             Rectangle().fill(T.hairline).frame(height: 0.5)
 
             HStack(spacing: 6) {
-                IconButton("sidebar.left", active: chainOpen) { withAnimation(T.snap) { chainOpen.toggle() } }
+                IconButton("sidebar.left", active: chainOpen) { chainOpen.toggle() }
                     .help(chainOpen ? "Hide chain" : "Show chain")
-                IconButton("waveform.path.ecg", active: showGraph) { withAnimation(T.snap) { showGraph.toggle() } }
+                IconButton("waveform.path.ecg", active: showGraph) { showGraph.toggle() }
                     .help(showGraph ? "Hide graph" : "Show response and spectrum")
                 Button { audio.setBypass(!audio.rack.bypass) } label: {
                     Text("Bypass").font(.system(size: 11, weight: .medium))
@@ -1201,7 +1336,13 @@ struct RackTab: View {
                 .menuStyle(.borderlessButton).menuIndicator(.hidden).fixedSize()
                 .help("Device sample rate")
                 .disabled(audio.outputRates.count < 2)
-                IconButton("arrow.uturn.backward") { audio.resetRack() }.help("Reset rack")
+                IconButton("arrow.uturn.backward") { audio.undoRack() }
+                    .disabled(!active || !audio.canUndoRack)
+                    .help("Undo rack edit (⌘Z)")
+                IconButton("arrow.uturn.forward") { audio.redoRack() }
+                    .disabled(!active || !audio.canRedoRack)
+                    .help("Redo rack edit (⇧⌘Z)")
+                IconButton("arrow.counterclockwise") { audio.resetRack() }.help("Reset rack")
             }
             .padding(.horizontal, m.gutter - 4).padding(.vertical, 8)
         }
@@ -1285,6 +1426,15 @@ struct PresetMenuItems: View {
 
     var body: some View {
         let device = audio.rackScope == .system ? audio.rackTarget : nil
+        Button { audio.clearPreset() } label: {
+            HStack {
+                Text("No preset")
+                if audio.rack.preset == nil && audio.rack.modules.isEmpty {
+                    Image(systemName: "checkmark")
+                }
+            }
+        }
+        Divider()
         if audio.presets.isEmpty {
             Text("No presets yet")
         }
@@ -1444,7 +1594,10 @@ struct ChainColumn: View {
                             .gesture(
                                 DragGesture(minimumDistance: 4, coordinateSpace: .named("chain"))
                                     .onChanged { value in
-                                        if dragging == nil { audio.selectedModule = module.id }
+                                        if dragging == nil {
+                                            audio.beginRackEdit()
+                                            audio.selectedModule = module.id
+                                        }
                                         dragging = module.id
                                         dragOffset = value.translation.height
                                     }
@@ -1455,6 +1608,7 @@ struct ChainColumn: View {
                                             dragging = nil
                                             dragOffset = 0
                                         }
+                                        audio.endRackEdit()
                                     }
                             )
                             .animation(dragging == module.id ? nil : T.quick, value: displacement(of: index))
@@ -1634,7 +1788,10 @@ struct ModuleEditor: View {
                 ScrollView {
                     VStack(alignment: .leading, spacing: m.gap) {
                         ForEach(module.kind.specs, id: \.key) { spec in
-                            ParamRow(spec: spec, value: module.param(spec.key)) { audio.setParam(module.id, spec.key, $0) }
+                            ParamRow(spec: spec, value: module.param(spec.key),
+                                     onEditingChanged: { editing in
+                                         if editing { audio.beginRackEdit() } else { audio.endRackEdit() }
+                                     }) { audio.setParam(module.id, spec.key, $0) }
                         }
                         switch module.kind {
                         case .parametricEQ: ParametricEditor(audio: audio, module: module)
@@ -1661,14 +1818,16 @@ struct IconButton: View {
     let symbol: String
     var active = false
     let action: () -> Void
+    @Environment(\.isEnabled) private var isEnabled
     @State private var hover = false
     init(_ symbol: String, active: Bool = false, action: @escaping () -> Void) { self.symbol = symbol; self.active = active; self.action = action }
     var body: some View {
         Button(action: action) {
             Image(systemName: symbol).font(.system(size: 10, weight: .medium))
-                .foregroundStyle(active ? T.accent : (hover ? .primary : .secondary)).frame(width: 24, height: 22)
-                .background(RoundedRectangle(cornerRadius: 6).fill(active ? T.press : (hover ? T.hover : .clear)))
-                .scaleEffect(hover ? 1.06 : 1)
+                .foregroundStyle(isEnabled ? (active ? T.accent : (hover ? .primary : .secondary)) : Color.primary.opacity(0.28))
+                .frame(width: 24, height: 22)
+                .background(RoundedRectangle(cornerRadius: 6).fill(isEnabled ? (active ? T.press : (hover ? T.hover : .clear)) : .clear))
+                .scaleEffect(isEnabled && hover ? 1.06 : 1)
         }
         .buttonStyle(Press(scale: 0.88)).onHover { hover = $0 }
         .animation(T.hoverAnim, value: hover)
@@ -1682,7 +1841,10 @@ struct Graph: View {
     @Environment(\.metrics) private var m
     @ObservedObject var audio: AudioState
     @ObservedObject private var meters: Meters
-    init(audio: AudioState) { self.audio = audio; self.meters = audio.meters }
+    let analyzing: Bool
+    init(audio: AudioState, analyzing: Bool) {
+        self.audio = audio; self.meters = audio.meters; self.analyzing = analyzing
+    }
 
     private static let fMin = 20.0, fMax = 20_000.0
     private static let points = 160
@@ -1745,7 +1907,8 @@ struct Graph: View {
         }
         .background(RoundedRectangle(cornerRadius: 8).fill(T.card))
         .overlay(RoundedRectangle(cornerRadius: 8).strokeBorder(T.hairline, lineWidth: 0.5))
-        .onAppear { meters.wantsSpectrum = true }
+        .onAppear { meters.wantsSpectrum = analyzing }
+        .onChange(of: analyzing) { _, enabled in meters.wantsSpectrum = enabled }
         .onDisappear { meters.wantsSpectrum = false }
     }
 
@@ -1826,13 +1989,19 @@ struct ParametricEditor: View {
 
             BandColumns(bands: bands, selected: current?.id, height: m.faderH,
                         select: { selectedBand = $0 },
-                        setGain: { id, g in audio.setBand(module.id, id) { $0.gainDB = g } })
+                        setGain: { id, g in audio.setBand(module.id, id) { $0.gainDB = g } },
+                        onEditingChanged: { editing in
+                            if editing { audio.beginRackEdit() } else { audio.endRackEdit() }
+                        })
 
             if let band = current {
                 BandDetail(band: band,
                            setType: { t in audio.setBand(module.id, band.id) { $0.type = t } },
                            setFreq: { f in audio.setBand(module.id, band.id) { $0.frequency = f } },
                            setQ: { q in audio.setBand(module.id, band.id) { $0.q = q } },
+                           onEditingChanged: { editing in
+                               if editing { audio.beginRackEdit() } else { audio.endRackEdit() }
+                           },
                            toggle: { audio.setBand(module.id, band.id) { $0.enabled.toggle() } },
                            remove: { audio.removeBand(module.id, band.id); selectedBand = nil })
             }
@@ -1867,6 +2036,7 @@ struct BandColumns: View {
     let height: CGFloat
     let select: (UUID) -> Void
     let setGain: (UUID, Double) -> Void
+    var onEditingChanged: (Bool) -> Void = { _ in }
     @Namespace private var highlight
 
     var body: some View {
@@ -1882,7 +2052,8 @@ struct BandColumns: View {
             HStack(alignment: .bottom, spacing: spacing) {
                 ForEach(bands) { band in
                     BandColumn(band: band, selected: band.id == selected, height: height,
-                               select: { select(band.id) }, setGain: { setGain(band.id, $0) })
+                               select: { select(band.id) }, setGain: { setGain(band.id, $0) },
+                               onEditingChanged: onEditingChanged)
                         .frame(width: width)
                         .background {
                             if band.id == selected {
@@ -1923,12 +2094,13 @@ struct BandColumn: View {
     let height: CGFloat
     let select: () -> Void
     let setGain: (Double) -> Void
-
+    var onEditingChanged: (Bool) -> Void = { _ in }
     var body: some View {
         VStack(spacing: 5) {
             Text(band.type.usesGain ? Self.gainLabel(band.gainDB) : "·")
                 .font(m.monoSmall).foregroundStyle(selected ? .primary : .tertiary).lineLimit(1)
-            VFader(value: band.gainDB, range: -18...18, label: { String(format: "%+.1f dB", $0) }) { setGain(($0 * 2).rounded() / 2) }
+            VFader(value: band.gainDB, range: -18...18, label: { String(format: "%+.1f dB", $0) },
+                   onEditingChanged: onEditingChanged) { setGain(($0 * 2).rounded() / 2) }
                 .frame(height: height)
                 .opacity(band.type.usesGain ? 1 : 0.3)
                 .disabled(!band.type.usesGain)
@@ -1950,6 +2122,7 @@ struct BandDetail: View {
     let setType: (FilterType) -> Void
     let setFreq: (Double) -> Void
     let setQ: (Double) -> Void
+    var onEditingChanged: (Bool) -> Void = { _ in }
     let toggle: () -> Void
     let remove: () -> Void
 
@@ -1970,12 +2143,12 @@ struct BandDetail: View {
             }
             HStack(spacing: 8) {
                 Text("Freq").font(.system(size: 11)).foregroundStyle(.secondary).frame(width: 34, alignment: .leading)
-                Fader(value: band.frequency, range: 20...20_000, log: true, label: Self.hz, set: setFreq)
+                Fader(value: band.frequency, range: 20...20_000, log: true, label: Self.hz, onEditingChanged: onEditingChanged, set: setFreq)
                 Text(Self.hz(band.frequency)).font(m.mono).foregroundStyle(.secondary).lineLimit(1).frame(width: 64, alignment: .trailing)
             }
             HStack(spacing: 8) {
                 Text("Q").font(.system(size: 11)).foregroundStyle(.secondary).frame(width: 34, alignment: .leading)
-                Fader(value: band.q, range: 0.1...12, log: true, label: { String(format: "%.2f", $0) }, set: setQ)
+                Fader(value: band.q, range: 0.1...12, log: true, label: { String(format: "%.2f", $0) }, onEditingChanged: onEditingChanged, set: setQ)
                 Text(String(format: "%.2f", band.q)).font(m.mono).foregroundStyle(.secondary).lineLimit(1).frame(width: 64, alignment: .trailing)
             }
         }
@@ -2212,7 +2385,12 @@ struct GraphicEditor: View {
                 ForEach(module.bands) { band in
                     VStack(spacing: 6) {
                         Text(BandColumn.gainLabel(band.gainDB)).font(m.monoSmall).foregroundStyle(.tertiary)
-                        VFader(value: band.gainDB, range: -12...12, label: { String(format: "%+.1f dB", $0) }) { g in audio.setBand(module.id, band.id) { $0.gainDB = (g * 2).rounded() / 2 } }
+                        VFader(value: band.gainDB, range: -12...12, label: { String(format: "%+.1f dB", $0) },
+                               onEditingChanged: { editing in
+                                   if editing { audio.beginRackEdit() } else { audio.endRackEdit() }
+                               }) { g in
+                            audio.setBand(module.id, band.id) { $0.gainDB = (g * 2).rounded() / 2 }
+                        }
                             .frame(height: 160)
                         Text(band.frequency >= 1000 ? String(format: "%.0fk", band.frequency / 1000) : String(format: "%.0f", band.frequency))
                             .font(m.monoSmall).foregroundStyle(.tertiary)
@@ -2224,7 +2402,11 @@ struct GraphicEditor: View {
             .background(RoundedRectangle(cornerRadius: 9).fill(T.card))
             HStack {
                 Spacer()
-                Button("Flatten") { for b in module.bands { audio.setBand(module.id, b.id) { $0.gainDB = 0 } } }
+                Button("Flatten") {
+                    audio.beginRackEdit()
+                    for b in module.bands { audio.setBand(module.id, b.id) { $0.gainDB = 0 } }
+                    audio.endRackEdit()
+                }
                     .font(.system(size: 11)).buttonStyle(.plain).foregroundStyle(.secondary)
             }
         }
