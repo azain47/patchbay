@@ -1,2 +1,4 @@
 patchbay.app/
 .DS_Store
+.build/
+dist/

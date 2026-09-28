@@ -7,10 +7,30 @@ A native, open-source DSP rack and per-app router for macOS system audio. No vir
   <img src="rack.png" width="566" alt="patchbay rack page with AutoEq profile">
 </p>
 
-[Download v1.3.0](https://github.com/azain47/patchbay/releases/tag/v1.3.0) ·
+[Download patchbay.dmg](https://github.com/azain47/patchbay/releases/latest/download/patchbay.dmg) ·
 [Watch the 45-second demo](https://github.com/azain47/patchbay/releases/download/v1.3.0/patchbay-linkedin.mp4)
 
 The demo is silent.
+
+## Install
+
+Requires an Apple Silicon Mac on macOS 15 or newer.
+
+1. Open `patchbay.dmg` and drag patchbay into Applications.
+2. Open patchbay. macOS says it can't verify the developer, because patchbay is
+   signed with its own certificate rather than a paid Apple Developer ID.
+   Open System Settings → Privacy & Security, scroll down, click *Open Anyway*
+   next to patchbay, and confirm. Only do this if you trust this repository;
+   you can also build from source instead.
+3. Click the patchbay icon in the menu bar and turn the rack on. macOS asks for
+   System Audio Recording permission once.
+
+After that, patchbay updates itself. It checks for a new release once a day
+and asks before installing (Settings → Updates to turn checks off or check now).
+Each update is verified against the project's update-signing key and must carry
+the same code signature as the installed app, which also keeps the audio
+permission across updates. Versions before 1.4.0 have no updater: download the
+DMG once.
 
 ## What it does
 
@@ -200,9 +220,38 @@ Requires macOS 15+ (Apple Silicon) and the Xcode Command Line Tools.
 open patchbay.app
 ```
 
+`build.sh` downloads [Sparkle](https://sparkle-project.org) 2.10.0 (MIT, the
+updater) once into `.build/` and checks its SHA-256. Without the project's
+signing certificate the build is ad-hoc signed; it runs, but macOS asks for
+audio permission again after every rebuild.
+
 On first rack enable, macOS asks for System Audio Recording permission.
 The rack is deliberately off at launch: patchbay never seizes system audio
 without being asked.
+
+## Releasing
+
+Push an annotated tag; its message is the release notes, shown on GitHub and in
+the update prompt:
+
+```sh
+git tag -a v1.4.1 -m "## Fixes
+- …" && git push origin v1.4.1
+```
+
+`.github/workflows/release.yml` builds with `scripts/release.sh`, signs the app
+and DMG, writes `appcast.xml` (the update feed, signed with Sparkle's EdDSA
+key) and publishes both on the release. Installed copies read the feed from
+`releases/latest/download/appcast.xml`. Repository secrets:
+
+| Secret | Contents |
+|---|---|
+| `SIGNING_P12_BASE64` | base64 of the "patchbay Code Signing" certificate and key (.p12) |
+| `SIGNING_P12_PASSWORD` | the .p12 password |
+| `SPARKLE_PRIVATE_KEY` | Sparkle EdDSA private key (`generate_keys -x`) |
+
+Losing either key means installed copies can no longer update; users would
+have to download a new DMG by hand.
 
 ## Microphone
 
@@ -236,4 +285,4 @@ latency.
 
 ## License
 
-[GPLv3](LICENSE). AutoEq data is MIT-licensed by Jaakko Pasanen and contributors. The virtual microphone driver is BlackHole, GPLv3 © Existential Audio Inc. (`VirtualMic/LICENSE`).
+[GPLv3](LICENSE). AutoEq data is MIT-licensed by Jaakko Pasanen and contributors. The virtual microphone driver is BlackHole, GPLv3 © Existential Audio Inc. (`VirtualMic/LICENSE`). The updater is Sparkle, MIT © the Sparkle Project contributors (license bundled at `patchbay.app/Contents/Resources/Sparkle-LICENSE`).

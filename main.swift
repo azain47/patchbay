@@ -1453,7 +1453,7 @@ final class Bar: NSObject, NSPopoverDelegate {
 
 final class Delegate: NSObject, NSApplicationDelegate {
     var bar: Bar?
-    func applicationDidFinishLaunching(_ n: Notification) { bar = Bar() }
+    func applicationDidFinishLaunching(_ n: Notification) { bar = Bar(); Updater.shared.start() }
     func applicationWillTerminate(_ n: Notification) { bar?.prepareForQuit() }
 }
 

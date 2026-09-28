@@ -441,6 +441,7 @@ struct Footer: View {
     @ObservedObject var audio: AudioState
     @ObservedObject var theme: Theme
     @State private var showSettings = false
+    @ObservedObject private var updater = Updater.shared
 
     var body: some View {
         HStack(spacing: 10) {
@@ -462,9 +463,12 @@ struct Footer: View {
             Spacer(minLength: 8)
             Button { showSettings.toggle() } label: {
                 Image(systemName: "gearshape").font(.system(size: 11)).foregroundStyle(.secondary).frame(width: 24, height: 22)
+                    .overlay(alignment: .topTrailing) {
+                        if updater.available != nil { Circle().fill(T.accent).frame(width: 5, height: 5).offset(x: -3, y: 3) }
+                    }
             }
             .buttonStyle(Press())
-            .help("Settings")
+            .help(updater.available.map { "Settings · patchbay \($0) is available" } ?? "Settings")
             .popover(isPresented: $showSettings, arrowEdge: .bottom) {
                 SettingsPopout(audio: audio, theme: theme)
             }
@@ -480,6 +484,7 @@ struct SettingsPopout: View {
     @Environment(\.metrics) private var m
     @ObservedObject var audio: AudioState
     @ObservedObject var theme: Theme
+    @ObservedObject private var updater = Updater.shared
 
     var body: some View {
         VStack(alignment: .leading, spacing: 14) {
@@ -546,8 +551,26 @@ struct SettingsPopout: View {
                     }
                 }
             }
+            SettingGroup("Updates") {
+                if let version = updater.available {
+                    HStack(alignment: .firstTextBaseline) {
+                        Text("patchbay \(version) is available.").font(.system(size: 11))
+                        Spacer()
+                        Button("Update…") { updater.check() }.font(.system(size: 11)).controlSize(.small)
+                    }
+                }
+                HStack(alignment: .center) {
+                    Toggle(isOn: Binding(get: { updater.automaticChecks }, set: { updater.automaticChecks = $0 })) {
+                        Text("Check daily").font(.system(size: 11))
+                    }
+                    .toggleStyle(.switch).controlSize(.mini).tint(T.accent)
+                    .help("Fetches the appcast from the latest GitHub release once a day. Nothing is installed without asking.")
+                    Spacer()
+                    Button("Check now") { updater.check() }.font(.system(size: 11)).controlSize(.small).disabled(!updater.canCheck)
+                }
+            }
             HStack {
-                Text("patchbay · GPLv3").font(m.monoSmall).foregroundStyle(.tertiary)
+                Text("patchbay \(Updater.version) · GPLv3").font(m.monoSmall).foregroundStyle(.tertiary)
                 Spacer()
                 Link("GitHub", destination: URL(string: "https://github.com/azain47/patchbay")!).font(.system(size: 11))
             }
