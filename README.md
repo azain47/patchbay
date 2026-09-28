@@ -231,13 +231,18 @@ without being asked.
 
 ## Releasing
 
-Push an annotated tag; its message is the release notes, shown on GitHub and in
-the update prompt:
+`main` and `staging` are protected: no direct pushes, force-pushes or deletion.
+Work lands on `staging` through a pull request, then `staging` → `main` through
+another. To release, tag a commit on `main` with an annotated tag; its message
+is the release notes, shown on GitHub and in the update prompt:
 
 ```sh
+git switch main && git pull
 git tag -a v1.4.1 -m "## Fixes
 - …" && git push origin v1.4.1
 ```
+
+The workflow refuses tags whose commit is not on `main`.
 
 `.github/workflows/release.yml` builds with `scripts/release.sh`, signs the app
 and DMG, writes `appcast.xml` (the update feed, signed with Sparkle's EdDSA
